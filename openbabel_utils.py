@@ -22,6 +22,15 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, Union
 
 from logger import default_logger as logger, performance_timer
+from constants import (
+    DEFAULT_FORCEFIELD,
+    OB_DEFAULT_TIMEOUT_SEC,
+    OB_LARGE_TIMEOUT_SEC,
+    OB_CONVERT_TIMEOUT_SEC,
+    OB_PNG_TIMEOUT_SEC,
+    COMMON_INPUT_FORMATS,
+    ATOMIC_WEIGHTS,
+)
 
 # ======================== 导入与版本兼容 ========================
 try:
@@ -48,12 +57,98 @@ _MOL_READ_CACHE_LOCK = threading.Lock()
 
 _OBABEL_CLI_LOCK = threading.Lock()  # 保护 _OBABEL_CLI_EXE 单例初始化
 
+# ======================== 问题三：用户可手动指定 obabel 可执行文件路径 ========================
+# 默认空串 = 自动解析（PATH + shutil.which）。
+# 用户通过「环境设置 / OpenBabel 路径设置」对话框写入 config["obabel_path"]，
+# 这里在 _resolve_obabel_cli 的最开头优先尝试。
+_MANUAL_OBABEL_PATH: str | None = None
+
+# OpenBabel 安装建议 / 故障诊断建议（纯文本，不含外部 URL 点击，避免安全弹窗）
+OB_INSTALL_GUIDE: str = (
+    "━━━━━━━━━━━━  OpenBabel 安装/故障排查指引  ━━━━━━━━━━━━\n"
+    "【推荐方式】\n"
+    "  1) conda 安装（最稳，CLI + Python 接口都会配好）：\n"
+    "       conda install -c conda-forge openbabel\n"
+    "  2) Windows 官网安装包：https://github.com/openbabel/openbabel/releases\n"
+    "     安装后把 C:\\Program Files\\OpenBabel-3.1.1 加入系统 PATH，再重启程序。\n"
+    "  3) pip 安装（成功率较低，只推荐纯 Python 场景）：\n"
+    "       pip install openbabel-wheel   # 或 pip install openbabel\n"
+    "\n"
+    "【本程序提供的修复入口】\n"
+    "  • 菜单「帮助 → 环境诊断」可一键检查依赖状态\n"
+    "  • 状态栏右下角的「OB 指示灯」（绿/红色圆点）点击可查看详情或手动指定路径\n"
+    "  • 直接点击「手动选择 obabel 路径」，浏览选中 obabel.exe（Linux/mac 为 obabel）即可\n"
+    "\n"
+    "【常见失败原因】\n"
+    "  • obabel 没加入系统 PATH，导致自动查找失败\n"
+    "  • 旧版 Windows 安装包只配了 GUI，没勾选「Add to PATH」\n"
+    "  • conda 环境没激活，导致程序只能看到基础 Python\n"
+    "  • 杀毒软件把 obabel.exe 当成可疑程序隔离（恢复白名单即可）\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+)
+
+
+def clear_caches() -> tuple[int, int]:
+    """
+    公开接口：安全地清空所有 OpenBabel 缓存（描述符 + 分子读取）。
+    返回: (evicted_desc_count, evicted_mol_read_count)
+    保证：即使清空过程中抛错，两个字典最终都处于「已清空」的一致状态。
+    """
+    d = 0
+    m = 0
+    with _DESC_CACHE_LOCK:
+        d = len(_DESC_CACHE)
+        _DESC_CACHE.clear()
+    with _MOL_READ_CACHE_LOCK:
+        m = len(_MOL_READ_CACHE)
+        _MOL_READ_CACHE.clear()
+    return d, m
+
 
 def _cache_key(path_str: str) -> tuple[str, int, int] | None:
     try:
         st = os.stat(path_str)
         return (os.fspath(Path(path_str).resolve()), int(st.st_mtime_ns), int(st.st_size))
     except OSError:
+        return None
+
+
+def cache_stats() -> dict[str, int]:
+    """公开接口：返回当前缓存状态（只读，内部加锁，对多线程安全）。"""
+    with _DESC_CACHE_LOCK:
+        dc = len(_DESC_CACHE)
+    with _MOL_READ_CACHE_LOCK:
+        mc = len(_MOL_READ_CACHE)
+    return {"descriptors": dc, "mol_read": mc, "desc_max": _DESC_CACHE_MAX, "mol_read_max": _MOL_READ_CACHE_MAX}
+
+
+# ======================== 问题三：手动 obabel 路径 ========================
+def set_manual_obabel_path(path: str | None) -> None:
+    """设置用户手动指定的 obabel 可执行文件路径。传入 None 或 "" 会清除手动设置并回退到自动查找。"""
+    global _MANUAL_OBABEL_PATH, _OBABEL_CLI_EXE
+    v = (path or "").strip() if path else ""
+    if not v:
+        _MANUAL_OBABEL_PATH = None
+    else:
+        _MANUAL_OBABEL_PATH = v
+    # 手动路径改了，必须让下一次调用重新解析（清掉已缓存的 _OBABEL_CLI_EXE）
+    with _OBABEL_CLI_LOCK:
+        _OBABEL_CLI_EXE = None
+
+
+def get_manual_obabel_path() -> str | None:
+    return _MANUAL_OBABEL_PATH
+
+
+def _load_manual_from_config() -> str | None:
+    """在第一次解析 CLI 时，从配置懒加载用户手动路径（避免 openbabel_utils → config 循环 import）。"""
+    try:
+        from config import load_config
+        cfg = load_config()
+        v = str(cfg.get("obabel_path", "") or "").strip()
+        return v or None
+    except Exception as _e:
+        logger.debug("从配置加载 obabel_path 失败，忽略: %s", _e)
         return None
 
 
@@ -65,38 +160,159 @@ def _resolve_obabel_cli() -> str:
     """
     安全解析 obabel 命令行可执行文件的绝对路径，
     避免相对名 + PATH 搜索导致的本地可执行文件劫持（B607/CWE-426）。
-    解析结果缓存，避免每次调用重复 which；
-    加锁保护 _OBABEL_CLI_EXE 单例初始化（多线程竞态下重复 which 可能不一致）。
+
+    ===== 放宽策略（问题三修复） =====
+      - 顺序：① 手动路径（用户显式指定）② PATH 中的 obabel ③ 常见安装目录兜底
+      - 只拒绝 tempdir / 当前工作目录 下的真实可执行（因为它们是典型的劫持目录）
+      - 不再一概拒绝用户家目录：conda 安装到 ~/anaconda3/bin、~/miniconda3/bin、
+        ~/AppData/Local/Continuum/anacondaX 等都是用户常用合法路径；另外「手动路径」
+        因为是用户明确点选，视为显式信任，不再做目录黑白名单。
+      - 解析结果缓存，加锁保护单例初始化。
     """
     import shutil as _shutil
-    global _OBABEL_CLI_EXE
+    import tempfile as _tempfile
+    global _OBABEL_CLI_EXE, _MANUAL_OBABEL_PATH
+
+    def _candidate_locations() -> list[str]:
+        """兜底：常见安装位置（只在 shutil.which 找不到时试，避免误劫持）。"""
+        home = Path.home()
+        out: list[str] = []
+        if sys.platform == "win32":
+            candidates = [
+                r"C:\Program Files\OpenBabel-3.1.1\obabel.exe",
+                r"C:\Program Files\OpenBabel-3.0.0\obabel.exe",
+                r"C:\Program Files (x86)\OpenBabel-3.1.1\obabel.exe",
+                str(home / "anaconda3" / "Library" / "bin" / "obabel.exe"),
+                str(home / "miniconda3" / "Library" / "bin" / "obabel.exe"),
+                str(home / "Miniconda3" / "Library" / "bin" / "obabel.exe"),
+                str(home / "Anaconda3" / "Library" / "bin" / "obabel.exe"),
+                str(home / "AppData" / "Local" / "Programs" / "OpenBabel" / "obabel.exe"),
+            ]
+            out.extend(candidates)
+        else:
+            out.extend([
+                "/usr/bin/obabel",
+                "/usr/local/bin/obabel",
+                "/opt/homebrew/bin/obabel",              # macOS Apple Silicon
+                "/usr/local/homebrew/bin/obabel",        # macOS Intel
+                str(home / "anaconda3" / "bin" / "obabel"),
+                str(home / "miniconda3" / "bin" / "obabel"),
+                str(home / "miniforge3" / "bin" / "obabel"),
+                str(home / "mambaforge" / "bin" / "obabel"),
+                str(home / "bin" / "obabel"),
+            ])
+        return out
+
+    def _safe_real(p: Path, *, user_explicit: bool) -> Path:
+        """解析真实路径 + 安全检查。
+        user_explicit=True 时：只做「存在性 + 是文件」检查，不再限制目录（视为用户显式信任）。
+        user_explicit=False 时：拒绝 tempdir 和 cwd（家目录放行）。
+        """
+        try:
+            real = p.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"obabel 路径不存在或不可读: {p}") from exc
+        if not real.is_file():
+            raise RuntimeError(f"obabel 路径不是文件: {real}")
+        if user_explicit:
+            # 用户显式选择的路径：信任他的选择，但仍然校验可执行（后面 _run_obabel 调用时会得到真实报错）
+            logger.info("使用用户指定的 OpenBabel CLI: %s", real)
+            return real
+        # 自动路径的安全检查：只拒绝 临时目录 和 当前工作目录
+        unsafe_roots: list[Path] = []
+        for _cand in (
+            _tempfile.gettempdir(),
+            os.getcwd(),
+        ):
+            try:
+                unsafe_roots.append(Path(_cand).resolve(strict=False))
+            except Exception as _e:
+                logger.debug("obabel 安全路径检查：跳过不可解析目录 %r: %s", _cand, _e)
+        for root in unsafe_roots:
+            try:
+                real.relative_to(root)
+                raise RuntimeError(
+                    f"出于安全考虑，拒绝执行在可写目录下的 obabel 真实路径: {real}（父目录={root}），"
+                    "请把它移动到系统路径，或通过「菜单→帮助→环境诊断」手动选择该路径以显式信任。"
+                )
+            except ValueError:
+                # ValueError = 不在 root 下，是期望的安全结果
+                logger.debug("obabel 路径安全检查通过：%s 不在 %s 下", real, root)
+        return real
+
     # 双检锁（DCL）避免频繁抢锁
     if _OBABEL_CLI_EXE is not None:
         return _OBABEL_CLI_EXE
     with _OBABEL_CLI_LOCK:
         if _OBABEL_CLI_EXE is not None:
             return _OBABEL_CLI_EXE
+
+        # Step 1：懒加载用户手动配置路径（第一次调用才读 config）
+        if _MANUAL_OBABEL_PATH is None:
+            cfg_v = _load_manual_from_config()
+            if cfg_v:
+                _MANUAL_OBABEL_PATH = cfg_v
+
+        # Step 2：手动路径优先
+        if _MANUAL_OBABEL_PATH:
+            real_path = _safe_real(Path(_MANUAL_OBABEL_PATH), user_explicit=True)
+            _OBABEL_CLI_EXE = str(real_path)
+            return _OBABEL_CLI_EXE
+
+        # Step 3：shutil.which（PATH 解析）
         resolved = _shutil.which("obabel")
-        if not resolved:
+        real_path: Path | None = None
+        if resolved:
+            try:
+                real_path = _safe_real(Path(resolved), user_explicit=False)
+            except RuntimeError as _e:
+                logger.warning("自动解析的 obabel 路径不安全/不可用：%s，继续尝试常见目录", _e)
+                real_path = None
+
+        # Step 4：常见安装目录兜底
+        if real_path is None:
+            last_err: Exception | None = None
+            for cand in _candidate_locations():
+                if not os.path.isfile(cand):
+                    continue
+                try:
+                    real_path = _safe_real(Path(cand), user_explicit=False)
+                    break
+                except RuntimeError as _e:
+                    last_err = _e
+                    logger.debug("obabel 兜底候选不可用 %s: %s", cand, _e)
+            if real_path is None and last_err is not None:
+                # 把兜底里最严重的错误也带出去，方便诊断
+                raise RuntimeError(
+                    "未找到可用的 obabel（OpenBabel 命令行），请安装或手动指定路径。\n"
+                    f"最近一次失败原因：{last_err}"
+                )
+
+        if real_path is None:
             raise RuntimeError(
-                "未在 PATH 中找到 obabel（OpenBabel 命令行），请安装后重试。"
-                "已拒绝使用相对名 obabel 执行（防止工作目录同名恶意可执行劫持）。"
+                "未在 PATH 和常见安装目录中找到 obabel（OpenBabel 命令行），请安装后重试。\n"
+                "也可以通过「菜单 → 帮助 → 环境诊断 → 手动选择 obabel 路径」指定。"
             )
-        resolved_path = Path(resolved)
-        try:
-            resolved_path = resolved_path.resolve(strict=True)
-        except OSError as exc:
-            raise RuntimeError(f"obabel 解析到的路径不存在: {resolved}") from exc
-        if resolved_path.is_symlink() or not resolved_path.is_file():
-            raise RuntimeError(f"obabel 路径必须是真实文件而非符号链接: {resolved_path}")
-        _OBABEL_CLI_EXE = str(resolved_path)
+        _OBABEL_CLI_EXE = str(real_path)
         return _OBABEL_CLI_EXE
 
 
-def _run_obabel(args: List[str], timeout: Optional[int] = None, check: bool = False) -> subprocess.CompletedProcess:
+def _run_obabel(args: List[str], timeout: Optional[int] = OB_DEFAULT_TIMEOUT_SEC,
+                check: bool = False) -> subprocess.CompletedProcess:
     """
     安全执行 obabel 命令，自动处理 Windows 控制台窗口隐藏。
     args[0] 应为 "obabel"（相对名占位），此函数会替换为已解析的绝对路径。
+
+    H-2 修复：timeout 默认从 constants 取 OB_DEFAULT_TIMEOUT_SEC（60s），不再是 None；
+    避免异常 obabel 死锁卡住整个后台任务。大分子场景可显式传 OB_LARGE_TIMEOUT_SEC 或更大值。
+    若需要无限制（极少场景），显式传 timeout=None。
+
+    【审计 2.1 修复：命令参数防选项注入】
+    所有调用方给出的「位置参数」（输入文件、输出文件、SMILES 串等）：
+      a) 若该参数是「文件路径」，则一律转换为绝对路径；
+      b) 若该参数可能是 "-" 开头的文件名，在前面补 "./"（Unix）或保留绝对路径。
+    同时，本函数对每个 token 做最基本的 NUL/CR/LF 剔除，避免 subprocess 层报错或潜在的
+    选项拼接风险。
     """
     if sys.platform == "win32":
         startupinfo = subprocess.STARTUPINFO()
@@ -112,10 +328,84 @@ def _run_obabel(args: List[str], timeout: Optional[int] = None, check: bool = Fa
         raise ValueError("_run_obabel 调用缺少命令参数")
     exe = _resolve_obabel_cli()
     real_args: list[str] = [exe]
+
+    def _hygiene(token: str) -> str:
+        """剔除 CR / LF / NUL，防止命令行层被注入控制字符或截断。"""
+        if token is None:
+            return ""
+        if not isinstance(token, str):
+            token = str(token)
+        for bad in ("\x00", "\r", "\n"):
+            if bad in token:
+                token = token.replace(bad, "")
+        return token
+
+    def _sanitize_file_path_arg(token: str) -> str:
+        """把文件路径变成绝对路径（若存在），并做 hygiene。绝对路径天然不会被当作选项。"""
+        t = _hygiene(token)
+        if not t:
+            return t
+        p = Path(t)
+        try:
+            if p.exists() or p.parent.exists():
+                # 走绝对路径：避免 "-foo.xyz" 被 obabel 当选项
+                return os.path.abspath(os.fspath(p))
+        except OSError:
+            pass
+        if not p.is_absolute():
+            # 相对路径以 "-" 开头：用 "./" 前缀（或 Windows 下 ".\\"）防被 obabel 当选项
+            if p.name.startswith("-"):
+                return os.path.join(".", os.fspath(p))
+        return os.path.abspath(os.fspath(p)) if not t.startswith("-") else os.path.join(".", t)
+
+    rest: List[str] = []
     if args[0] in ("obabel", "obabel.exe", str(Path("obabel"))):
-        real_args.extend(args[1:])
+        rest = list(args[1:])
     else:
-        real_args.extend(args)
+        rest = list(args)
+
+    # 规则：
+    #   - 如果 token 形如 "-O"、"-m" 这种单字母开关，或 "--..." 长选项，原样保留；
+    #   - 如果 token 前面紧跟的开关是 "-O" / "-xi" / "-xo" / "--align" / "-a" / "-s" / "-v" / "-O"
+    #     等已知要求文件 / 字符串值的开关，就做对应清洗（文件或纯字符串 hygiene）。
+    #   - 其余自由位置参数视为输入文件 → _sanitize_file_path_arg。
+    FILE_SWITCHES = {"-O", "-xi", "-xo", "-xr", "-xc", "--align", "-p"}
+    VALUE_SWITCHES_EXPECT_FILE = FILE_SWITCHES
+
+    i = 0
+    n = len(rest)
+    while i < n:
+        tok = _hygiene(rest[i])
+        if not tok:
+            i += 1
+            continue
+        if tok == "--":
+            # 显式「之后全是位置参数」：之后全部视为输入文件
+            real_args.append("--")
+            i += 1
+            while i < n:
+                real_args.append(_sanitize_file_path_arg(rest[i]))
+                i += 1
+            break
+        if tok in VALUE_SWITCHES_EXPECT_FILE and i + 1 < n:
+            real_args.append(tok)
+            real_args.append(_sanitize_file_path_arg(rest[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("-"):
+            # 其他开关（可能无值）：直接加，值用 hygiene
+            real_args.append(tok)
+            # 处理 紧接的值（如果不是另一个开关，就做 hygiene）
+            if i + 1 < n and not rest[i + 1].startswith("-"):
+                real_args.append(_hygiene(rest[i + 1]))
+                i += 2
+            else:
+                i += 1
+            continue
+        # 自由位置参数 → 输入文件
+        real_args.append(_sanitize_file_path_arg(tok))
+        i += 1
+
     return subprocess.run(
         real_args,
         capture_output=True,
@@ -127,34 +417,171 @@ def _run_obabel(args: List[str], timeout: Optional[int] = None, check: bool = Fa
     )
 
 
+# 输出路径安全校验：统一包装（审计 1.1 路径遍历修复）
+def _secure_output_path(
+    requested_path,
+    *,
+    base_dir=None,
+    is_dir: bool = False,
+    default_name=None,
+    allow_outside: bool = False,
+    create_parent: bool = False,
+) -> Path:
+    """
+    对 obabel 输出文件 / 目录路径做安全解析。
+    base_dir 若为 None：
+      - 若 requested_path 是绝对路径，走 allow_outside 判定（默认仍不允许越出 None 语义
+        上的 work_dir，但若调用方明确 allow_outside=True 则放行）；
+      - 若为相对路径：以当前工作目录（tempfile.gettempdir fallback）为基准，
+        但我们更建议调用方显式传 base_dir。
+    """
+    from model import resolve_secure_output_path_external
+
+    if base_dir is None:
+        # 兜底：优先当前 cwd；不存在时 fallback 到临时目录
+        try:
+            cwd = Path.cwd()
+            if cwd.is_dir():
+                base_dir = cwd
+            else:
+                raise RuntimeError
+        except Exception:
+            base_dir = Path(tempfile.gettempdir())
+    return resolve_secure_output_path_external(
+        requested_path,
+        base_dir=base_dir,
+        is_dir=is_dir,
+        default_name=default_name,
+        allow_outside=allow_outside,
+        create_parent=create_parent,
+    )
+
+
 # ======================== 环境检测 ========================
-def check_openbabel() -> Tuple[bool, str]:
+def check_openbabel() -> Tuple[bool, str, Dict[str, Any]]:
     """
     检测 Open Babel 是否可用，优先使用 pybel 接口，其次检测命令行。
-    返回 (可用性, 消息)。
+
+    增强版（问题三修复）：返回更详细信息，包括版本、支持的格式数、接口类型、
+    用户指定的路径、安装指引 install_guide 等。
+
+    返回: (可用性, 消息, 详情字典)
+    详情字典 keys:
+      - interfaces_available: list[str]  ("pybel" / "cli")
+      - pybel_version / cli_version: str 或 None
+      - supported_format_count: int 或 None
+      - warnings: list[str]
+      - manual_path_used: bool
+      - resolved_cli_path: str | None
+      - install_guide: str (OB_INSTALL_GUIDE，UI 可直接展示)
+      - diagnosis: str[] (按严重程度排的诊断建议)
     """
+    global _MANUAL_OBABEL_PATH
+    details: Dict[str, Any] = {
+        "interfaces_available": [],
+        "pybel_version": None,
+        "cli_version": None,
+        "supported_format_count": None,
+        "warnings": [],
+        "manual_path_used": False,
+        "resolved_cli_path": None,
+        "install_guide": OB_INSTALL_GUIDE,
+        "diagnosis": [],
+    }
+    warning_list: list[str] = details["warnings"]
+    diagnosis_list: list[str] = details["diagnosis"]
+
+    # 首次探测：懒加载手动路径 + 检查手动路径是否配了
+    if _MANUAL_OBABEL_PATH is None:
+        _MANUAL_OBABEL_PATH = _load_manual_from_config()
+    if _MANUAL_OBABEL_PATH:
+        details["manual_path_used"] = True
+
     # 1. 检测 pybel
+    pybel_ok = False
     if PYBEL_AVAILABLE:
         try:
-            # 尝试创建一个简单分子验证
             mol = pybel.readstring("smi", "C")
             if mol:
-                return True, "pybel 接口可用"
+                pybel_ok = True
+                details["interfaces_available"].append("pybel")
+                try:
+                    details["pybel_version"] = getattr(ob, "__version__", None) or \
+                                                getattr(pybel, "__version__", None) or \
+                                                "unknown"
+                except Exception as _ve:
+                    logger.debug("pybel 版本探测失败: %s", _ve)
+                try:
+                    n_fmts = len(getattr(pybel, "informats", {})) + len(getattr(pybel, "outformats", {}))
+                    details["supported_format_count"] = max(0, n_fmts)
+                except Exception as _ce:
+                    logger.debug("pybel 支持格式计数失败: %s", _ce)
             else:
-                return False, "pybel 接口不可用（无法创建分子）"
+                warning_list.append("pybel 导入但无法创建测试分子 CH4")
         except Exception as e:
-            # pybel 存在但有问题，降级到命令行
-            warnings.warn(f"pybel 导入但不可用: {e}，尝试命令行")
+            warning_list.append(f"pybel 接口异常: {e}")
+    else:
+        diagnosis_list.append("未检测到 Python 包 pybel/openbabel（仅影响部分高级功能），建议安装 conda 版 OpenBabel")
 
     # 2. 检测命令行
+    cli_ok = False
     try:
-        result = _run_obabel(["obabel", "-V"], timeout=2)
-        if result.returncode == 0 and result.stdout.strip():
-            return True, f"obabel 命令行可用 (版本: {result.stdout.strip()})"
-        else:
-            return False, "obabel 命令行不可用"
+        # 先拿到解析到的路径（失败也不能让整个 check 抛错，只记 warning）
+        try:
+            exe = _resolve_obabel_cli()
+            details["resolved_cli_path"] = exe
+        except Exception as _re:
+            warning_list.append(f"obabel 命令行未找到或不可用: {_re}")
+            exe = None
+        if exe:
+            result = _run_obabel(["obabel", "-V"], timeout=OB_VERSION_TIMEOUT_SEC)
+            if result.returncode == 0 and result.stdout.strip():
+                cli_ok = True
+                details["interfaces_available"].append("cli")
+                details["cli_version"] = result.stdout.strip()
+            else:
+                warning_list.append(f"obabel -V 返回码={result.returncode}, stderr={result.stderr[:200]}")
     except Exception as e:
-        return False, f"无法运行 obabel: {e}"
+        warning_list.append(f"无法运行 obabel 命令行: {e}")
+
+    if not cli_ok:
+        if details.get("manual_path_used"):
+            diagnosis_list.append("已配置手动 obabel 路径，但命令行仍不可用，请检查路径是否指向正确的可执行文件（Windows 下应为 obabel.exe）")
+        else:
+            diagnosis_list.append("未找到 obabel 命令行：推荐执行 conda install -c conda-forge openbabel，或使用下方「手动选择路径」")
+        diagnosis_list.append("点击状态栏右下角的红点（OB 指示灯）可查看完整诊断并一键进入手动路径设置")
+
+    # 汇总
+    available = pybel_ok or cli_ok
+    if available:
+        if pybel_ok and cli_ok:
+            msg = f"pybel + CLI 双接口可用（pybel={details['pybel_version']}, cli={details['cli_version']}）"
+        elif pybel_ok:
+            msg = f"pybel 接口可用（版本={details['pybel_version']}）"
+        else:
+            msg = f"obabel 命令行可用（版本={details['cli_version']}）"
+        if details["supported_format_count"]:
+            msg += f"，支持约 {details['supported_format_count']} 种格式"
+        if details["resolved_cli_path"]:
+            msg += f"；CLI 路径={details['resolved_cli_path']}"
+        if details["manual_path_used"]:
+            msg += "（使用用户手动指定路径）"
+        if warning_list:
+            msg += f"（警告：{len(warning_list)} 条）"
+    else:
+        msg_parts = ["OpenBabel 不可用"]
+        if warning_list:
+            msg_parts.append("；".join(warning_list[:2]))
+        msg_parts.append("点击下方「环境诊断」或状态栏红点查看完整解决指引")
+        msg = "，".join(msg_parts)
+
+    return available, msg, details
+
+
+def check_openbabel_simple() -> Tuple[bool, str]:
+    """兼容旧调用方：只返回 (bool, str)，内部调用增强版。"""
+    ok, msg, _ = check_openbabel()
+    return ok, msg
 
 
 def get_supported_formats() -> List[str]:
@@ -162,28 +589,29 @@ def get_supported_formats() -> List[str]:
     获取 Open Babel 支持的读写格式列表。
     返回格式名称列表（字符串）。
     """
-    formats = set()
+    formats: set[str] = set()
     if PYBEL_AVAILABLE:
         try:
             formats.update(pybel.informats.keys())
             formats.update(pybel.outformats.keys())
-        except AttributeError:
-            pass
+        except AttributeError as _ae:
+            logger.debug("pybel informats/outformats 属性缺失: %s", _ae)
     else:
         try:
-            result = _run_obabel(["obabel", "-L", "formats"], timeout=5)
+            result = _run_obabel(["obabel", "-L", "formats"], timeout=OB_PROPLIST_TIMEOUT_SEC)
             if result.returncode == 0:
                 for line in result.stdout.strip().splitlines():
                     parts = line.strip().split()
                     if parts:
                         formats.add(parts[0])
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("obabel CLI 查询格式列表失败: %s", _e)
     return sorted(formats)
 
 
 # ======================== 格式转换 ========================
-_COMMON_IN_FORMATS = ("xyz", "mol", "mol2", "smi", "sdf", "cml", "pdb", "inchi", "cif")
+# 集中化：从 constants 复用，避免多处重复硬编码
+_COMMON_IN_FORMATS = COMMON_INPUT_FORMATS
 
 def _read_molecules(input_path: str, input_ext: str) -> list:
     """从 pybel 读入，空扩展名时先尝试常见扩展名，失败后再穷举。带 (path,mtime,size,ext) LRU 缓存；读写均加锁。"""
@@ -238,10 +666,11 @@ def convert_file(input_path: str, output_path: str, output_format: str) -> Dict[
     if not ext or ext[1:].lower() != output_format.lower():
         output_path = f"{base}.{output_format}" if base else f"output.{output_format}"
 
-    # 确保输出目录存在
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # 【审计 1.1 路径遍历加固】：输出路径走安全解析，创建父目录
+    try:
+        output_path = str(_secure_output_path(output_path, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出路径非法: {e}", "output_path": None}
 
     try:
         if PYBEL_AVAILABLE:
@@ -258,7 +687,7 @@ def convert_file(input_path: str, output_path: str, output_format: str) -> Dict[
         else:
             # 使用命令行
             cmd = ["obabel", input_path, "-O", output_path]
-            result = _run_obabel(cmd, timeout=30)
+            result = _run_obabel(cmd, timeout=OB_CONVERT_TIMEOUT_SEC)
             if result.returncode == 0 and os.path.exists(output_path):
                 return {"success": True, "message": f"成功转换为 {output_format}", "output_path": output_path}
             else:
@@ -274,14 +703,28 @@ def generate_from_smiles(
     output_dir: str = ".",
     generate_3d: bool = True,
     optimize: bool = True,
-    forcefield: str = "mmff94"
+    forcefield: str = DEFAULT_FORCEFIELD,
 ) -> Dict[str, Any]:
     """
     从 SMILES 生成 3D 分子文件（.mol 和 .xyz）。
     返回: {'success': bool, 'message': str, 'mol': str, 'xyz': str}
     """
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
+    # 【审计 1.1】输出目录安全解析
+    try:
+        output_dir = str(_secure_output_path(output_dir, is_dir=True, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出目录非法: {e}", "mol": None, "xyz": None}
+    # 同样校验 prefix：避免包含路径分隔符 / ..，保证只会在 output_dir 下生成文件
+    try:
+        from model import enforce_no_path_separators
+    except Exception:
+        def enforce_no_path_separators(name: str) -> None:
+            if any(ch in name for ch in ("/", "\\", "\x00", "\r", "\n")):
+                raise ValueError(f"文件名前缀包含非法字符: {name!r}")
+    try:
+        enforce_no_path_separators(output_prefix)
+    except ValueError as e:
+        return {"success": False, "message": f"文件前缀非法: {e}", "mol": None, "xyz": None}
 
     mol_path = os.path.join(output_dir, f"{output_prefix}.mol")
     xyz_path = os.path.join(output_dir, f"{output_prefix}.xyz")
@@ -310,7 +753,8 @@ def generate_from_smiles(
                 cmd_mol.append("--gen3d")
                 if optimize:
                     cmd_mol.extend(["--minimize", "--ff", forcefield])
-            result_mol = _run_obabel(cmd_mol, timeout=60)
+            # gen3d + minimize 对大分子可能较慢，使用较大超时
+            result_mol = _run_obabel(cmd_mol, timeout=OB_LARGE_TIMEOUT_SEC)
             if result_mol.returncode != 0 or not os.path.exists(mol_path):
                 return {
                     "success": False,
@@ -337,15 +781,17 @@ def generate_from_smiles(
 
 
 # ======================== 力场优化 ========================
-def optimize_geometry(input_path: str, output_path: str, forcefield: str = "mmff94") -> Dict[str, Any]:
+def optimize_geometry(input_path: str, output_path: str,
+                      forcefield: str = DEFAULT_FORCEFIELD) -> Dict[str, Any]:
     """
     使用 Open Babel 力场优化分子结构。
     返回: {'success': bool, 'message': str, 'output_path': str}
     """
-    # 确保输出目录存在
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # 【审计 1.1】输出路径安全解析
+    try:
+        output_path = str(_secure_output_path(output_path, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出路径非法: {e}", "output_path": None}
 
     try:
         if PYBEL_AVAILABLE:
@@ -388,7 +834,8 @@ def optimize_geometry(input_path: str, output_path: str, forcefield: str = "mmff
         else:
             # 命令行优化：obabel input -O output --minimize --ff MMFF94
             cmd = ["obabel", input_path, "-O", output_path, "--minimize", "--ff", forcefield]
-            result = _run_obabel(cmd, timeout=60)
+            # 力场优化对大分子较慢，使用 OB_LARGE_TIMEOUT_SEC
+            result = _run_obabel(cmd, timeout=OB_LARGE_TIMEOUT_SEC)
             if result.returncode == 0 and os.path.exists(output_path):
                 return {"success": True, "message": "优化完成", "output_path": output_path}
             else:
@@ -438,8 +885,8 @@ def calculate_descriptors(input_path: str) -> Dict[str, Any]:
                         if callable(v):
                             v = v()
                         descriptors[attr_key] = float(v)
-                    except Exception:
-                        pass
+                    except Exception as _de:
+                        logger.debug("计算描述符 %s 失败: %s", attr_key, _de)
                 result = {"success": True, "message": "描述符计算成功", "descriptors": descriptors}
         else:
             # 命令行模式（有限支持）
@@ -458,8 +905,8 @@ def calculate_descriptors(input_path: str) -> Dict[str, Any]:
                 if os.path.exists(tmp_name):
                     try:
                         os.unlink(tmp_name)
-                    except OSError:
-                        pass
+                    except OSError as _oe:
+                        logger.debug("清理 obabel 临时描述符文件失败: %s, err=%s", tmp_name, _oe)
             result = {"success": True, "message": "命令行模式描述符（有限）", "descriptors": descriptors}
     except Exception as e:
         result = {"success": False, "message": str(e), "descriptors": {}}
@@ -498,27 +945,23 @@ def analyze_formula(input_path: str) -> Dict[str, Any]:
         elements: dict[str, int] = {}
         try:
             formula = obmol.GetFormula() if hasattr(obmol, "GetFormula") else ""
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("obmol.GetFormula() 失败: %s", _e)
         try:
             mw_exact = float(obmol.GetExactMass()) if hasattr(obmol, "GetExactMass") else 0.0
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("obmol.GetExactMass() 失败: %s", _e)
         try:
             mw_avg = float(obmol.GetMolWt()) if hasattr(obmol, "GetMolWt") else 0.0
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("obmol.GetMolWt() 失败: %s", _e)
         try:
             atoms_iter = obmol.GetAtoms() if hasattr(obmol, "GetAtoms") else list(mol.atoms)
-        except Exception:
+        except Exception as _e:
+            logger.debug("obmol.GetAtoms() 失败，回退 mol.atoms: %s", _e)
             atoms_iter = list(mol.atoms)
-        atomic_weights: dict[str, float] = {
-            "H": 1.00794, "He": 4.002602, "Li": 6.941, "Be": 9.012182, "B": 10.811,
-            "C": 12.0107, "N": 14.0067, "O": 15.9994, "F": 18.9984032, "Ne": 20.1797,
-            "Na": 22.989770, "Mg": 24.3050, "Al": 26.981538, "Si": 28.0855, "P": 30.973762,
-            "S": 32.065, "Cl": 35.453, "Ar": 39.948, "K": 39.0983, "Ca": 40.078,
-            "Fe": 55.845, "Cu": 63.546, "Zn": 65.38, "Br": 79.904, "I": 126.90447,
-        }
+        # 集中化：从 constants 复用原子量表，方便统一维护
+        atomic_weights: Dict[str, float] = dict(ATOMIC_WEIGHTS)
         tot_mass = 0.0
         atoms_count = 0
         try:
@@ -529,7 +972,8 @@ def analyze_formula(input_path: str) -> Dict[str, Any]:
                 elements[sym] = elements.get(sym, 0) + 1
                 tot_mass += w
                 atoms_count += 1
-        except Exception:
+        except Exception as _ae:
+            logger.debug("遍历原子失败，回退 formula 粗解析: %s", _ae)
             # 回退：按 formula 粗解析
             for m in re.findall(r"([A-Z][a-z]?)(\d*)", formula):
                 if not m[0]:
@@ -577,6 +1021,11 @@ def export_geometry_csv(input_path: str, out_csv_path: str) -> Dict[str, Any]:
     提取分子所有键长（Å）及所有可能的 1-2-3 键角（度），写 CSV。
     纯 OpenBabel 实现，不依赖任何量化软件。
     """
+    # 【审计 1.1】输出路径安全解析
+    try:
+        out_csv_path = str(_secure_output_path(out_csv_path, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出 CSV 路径非法: {e}"}
     try:
         ext = os.path.splitext(input_path)[1][1:].lower()
         mols = _read_molecules(input_path, ext)
@@ -745,22 +1194,27 @@ def batch_inchikey(paths: list[str]) -> Dict[str, str | None]:
             ext = os.path.splitext(fp)[1][1:].lower()
             mols = _read_molecules(fp, ext)
             if not mols:
-                ret[fp] = None; continue
+                ret[fp] = None
+                continue
             mol = mols[0]
             obmol = mol.OBMol
+            ik = ""
             try:
                 ik = str(mol.write("inchikey")).strip().split("\n")[0]
-            except Exception:
+            except Exception as _e1:
+                logger.debug("pybel.write(inchikey) 失败 %s: %s", fp, _e1)
+            if not ik:
                 try:
                     conv = ob.OBConversion()
                     conv.SetOutFormat("inchikey")
                     ik = conv.WriteString(obmol).strip().split("\n")[0]
-                except Exception:
-                    ik = ""
+                except Exception as _e2:
+                    logger.debug("OBConversion(inchikey) 失败 %s: %s", fp, _e2)
             if "=" in ik:
                 ik = ik.split("=", 1)[1].strip()
             ret[fp] = ik or None
-        except Exception:
+        except Exception as _be:
+            logger.debug("批量 InChIKey 处理失败 %s: %s", fp, _be)
             ret[fp] = None
     return ret
 
@@ -840,6 +1294,11 @@ def analyze_chirality(input_path: str) -> Dict[str, Any]:
 def invert_enantiomer(input_path: str, output_path: str) -> Dict[str, Any]:
     """翻转所有手性中心 → 生成对映体并写文件。"""
     try:
+        # 【审计 1.1】输出路径安全解析
+        try:
+            output_path = str(_secure_output_path(output_path, create_parent=True))
+        except ValueError as e:
+            return {"success": False, "message": f"输出路径非法: {e}"}
         ext = os.path.splitext(input_path)[1][1:].lower()
         out_ext = os.path.splitext(output_path)[1][1:].lower()
         if not PYBEL_AVAILABLE:
@@ -888,6 +1347,11 @@ def protonate_ph(input_path: str, output_path: str, ph: float = 7.4) -> Dict[str
     try:
         if not 0 <= ph <= 14:
             return {"success": False, "message": "pH 范围 0-14"}
+        # 【审计 1.1】输出路径安全解析
+        try:
+            output_path = str(_secure_output_path(output_path, create_parent=True))
+        except ValueError as e:
+            return {"success": False, "message": f"输出路径非法: {e}"}
         with tempfile.NamedTemporaryFile(suffix="." + (os.path.splitext(input_path)[1][1:] or "xyz"), delete=False) as _t1:
             pass
         with tempfile.NamedTemporaryFile(suffix="." + (os.path.splitext(output_path)[1][1:] or "xyz"), delete=False) as _t2:
@@ -895,7 +1359,8 @@ def protonate_ph(input_path: str, output_path: str, ph: float = 7.4) -> Dict[str
         try:
             shutil.copy2(input_path, _t1.name)
             cmd = ["obabel", _t1.name, "-O", _t2.name, "-p", f"{ph:g}"]
-            r = _run_obabel(cmd, timeout=120)
+            # pH 加氢需要构建完整 3D + 电荷分配，使用 OB_LARGE_TIMEOUT_SEC
+            r = _run_obabel(cmd, timeout=OB_LARGE_TIMEOUT_SEC)
             if r.returncode != 0 or not os.path.exists(_t2.name) or os.path.getsize(_t2.name) == 0:
                 return {"success": False, "message": f"obabel -p 返回码 {r.returncode}: {r.stderr[:300]}"}
             shutil.copy2(_t2.name, output_path)
@@ -903,8 +1368,10 @@ def protonate_ph(input_path: str, output_path: str, ph: float = 7.4) -> Dict[str
                     "message": f"已在 pH={ph:g} 下加氢：-COOH→-COO⁻、-NH2→-NH3⁺ 等"}
         finally:
             for t in (_t1.name, _t2.name):
-                try: os.unlink(t)
-                except OSError: pass
+                try:
+                    os.unlink(t)
+                except OSError as _oe:
+                    logger.debug("清理 pH 加氢临时文件失败 %s: %s", t, _oe)
     except Exception as e:
         return {"success": False, "message": f"pH 加氢失败：{e}"}
 
@@ -913,7 +1380,21 @@ def protonate_ph(input_path: str, output_path: str, ph: float = 7.4) -> Dict[str
 def split_multi_sdf(input_sdf: str, out_dir: str, prefix: str = "mol", format_ext: str = "xyz") -> Dict[str, Any]:
     """把一个 SDF（或任何多分子文件，.sdf/.mol2/.xyz 都行）拆成多个单分子文件。"""
     try:
-        os.makedirs(out_dir, exist_ok=True)
+        # 【审计 1.1】输出目录安全解析 + prefix 不允许包含路径分隔符
+        try:
+            out_dir = str(_secure_output_path(out_dir, is_dir=True, create_parent=True))
+        except ValueError as e:
+            return {"success": False, "message": f"输出目录非法: {e}"}
+        try:
+            from model import enforce_no_path_separators
+        except Exception:
+            def enforce_no_path_separators(name: str) -> None:
+                if any(ch in name for ch in ("/", "\\", "\x00", "\r", "\n")):
+                    raise ValueError(f"文件名前缀包含非法字符: {name!r}")
+        try:
+            enforce_no_path_separators(prefix)
+        except ValueError as e:
+            return {"success": False, "message": f"文件前缀非法: {e}"}
         if not PYBEL_AVAILABLE:
             return {"success": False, "message": "需要 pybel"}
         ext_in = os.path.splitext(input_sdf)[1][1:].lower() or "sdf"
@@ -942,7 +1423,8 @@ def split_multi_sdf(input_sdf: str, out_dir: str, prefix: str = "mol", format_ex
                 mol.write(ext_use, fp, overwrite=True)
                 if os.path.exists(fp):
                     ok += 1; names.append(fp)
-            except Exception:
+            except Exception as _we:
+                logger.debug("拆分分子写入 %s 失败: %s", name, _we)
                 continue
         return {"success": ok > 0, "total": len(mols), "ok": ok, "output_dir": out_dir, "files": names}
     except Exception as e:
@@ -960,12 +1442,16 @@ def merge_to_sdf(input_paths: list[str], output_sdf: str) -> Dict[str, Any]:
                 ext = os.path.splitext(fp)[1][1:].lower()
                 ms = _read_molecules(fp, ext) or []
                 all_mols.extend(ms)
-            except Exception:
+            except Exception as _re:
+                logger.debug("SDF 合并跳过文件 %s: %s", fp, _re)
                 continue
         if not all_mols:
             return {"success": False, "message": "未读取到任何分子"}
-        out_dir = os.path.dirname(output_sdf)
-        if out_dir: os.makedirs(out_dir, exist_ok=True)
+        # 【审计 1.1】输出 SDF 路径安全解析
+        try:
+            output_sdf = str(_secure_output_path(output_sdf, create_parent=True))
+        except ValueError as e:
+            return {"success": False, "message": f"输出 SDF 路径非法: {e}"}
         # 逐个 append 写 sdf（pybel write('sdf', multi=True)）
         with tempfile.NamedTemporaryFile(suffix=".sdf", delete=False, mode="wb") as _tmp:
             tmp_name = _tmp.name
@@ -979,19 +1465,23 @@ def merge_to_sdf(input_paths: list[str], output_sdf: str) -> Dict[str, Any]:
                             if hasattr(m, "OBMol"):
                                 s = conv.WriteString(m.OBMol)
                                 if s: f.write(s.encode("utf-8", errors="replace"))
-                        except Exception:
+                        except Exception as _we:
+                            logger.debug("SDF 合并写入单分子失败: %s", _we)
                             continue
             else:
                 with open(tmp_name, "w", encoding="utf-8") as f:
                     for i, m in enumerate(all_mols):
                         try:
                             f.write(m.write("sdf"))
-                        except Exception:
+                        except Exception as _we:
+                            logger.debug("SDF 合并 pybel.write 失败 (%d): %s", i, _we)
                             continue
             shutil.copy2(tmp_name, output_sdf)
         finally:
-            try: os.unlink(tmp_name)
-            except OSError: pass
+            try:
+                os.unlink(tmp_name)
+            except OSError as _oe:
+                logger.debug("清理 SDF 合并临时文件失败: %s, err=%s", tmp_name, _oe)
         size = os.path.getsize(output_sdf)
         return {"success": size > 0, "output_sdf": output_sdf, "molecules": len(all_mols), "bytes": size}
     except Exception as e:
@@ -1004,14 +1494,16 @@ def align_molecules(ref_path: str, mobile_path: str, output_path: str) -> Dict[s
     将移动分子叠加到参考分子上。
     返回: {'success': bool, 'message': str, 'output_path': str}
     """
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # 【审计 1.1】输出路径安全解析
+    try:
+        output_path = str(_secure_output_path(output_path, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出路径非法: {e}", "output_path": None}
 
     try:
         # 使用 obabel 的 --align 选项
         cmd = ["obabel", mobile_path, "-O", output_path, "--align", ref_path]
-        result = _run_obabel(cmd, timeout=30)
+        result = _run_obabel(cmd, timeout=OB_CONVERT_TIMEOUT_SEC)
         if result.returncode == 0 and os.path.exists(output_path):
             return {"success": True, "message": "叠加成功", "output_path": output_path}
         else:
@@ -1020,10 +1512,13 @@ def align_molecules(ref_path: str, mobile_path: str, output_path: str) -> Dict[s
         return {"success": False, "message": str(e), "output_path": None}
 
 
-def render_png_2d(input_path: str, output_path: str, width: int=800, height: int=600) -> Dict[str, Any]:
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+def render_png_2d(input_path: str, output_path: str, width: int = 800, height: int = 600) -> Dict[str, Any]:
+    """渲染 2D PNG 图：优先 pybel → OBDepict，最后回退 obabel CLI。"""
+    # 【审计 1.1】输出路径安全解析
+    try:
+        output_path = str(_secure_output_path(output_path, create_parent=True))
+    except ValueError as e:
+        return {"success": False, "message": f"输出路径非法: {e}", "output_path": None}
 
     try:
         if PYBEL_AVAILABLE:
@@ -1043,20 +1538,21 @@ def render_png_2d(input_path: str, output_path: str, width: int=800, height: int
                     depict.WritePNG(output_path)
                     if os.path.exists(output_path):
                         return {"success": True, "message": "2D PNG 渲染成功（OBDepict）", "output_path": output_path}
-                except Exception:
-                    pass
+                except Exception as _de:
+                    logger.debug("OBDepict 渲染失败: %s", _de)
 
                 try:
                     mol.draw(width=width, height=height, filename=output_path)
                     if os.path.exists(output_path):
                         return {"success": True, "message": "2D PNG 渲染成功（pybel.draw）", "output_path": output_path}
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as _de2:
+                    logger.debug("pybel.draw 渲染失败: %s", _de2)
+            except Exception as _re:
+                logger.debug("读取分子失败（2D PNG 渲染阶段）: %s", _re)
 
         cmd = ["obabel", input_path, "-O", output_path, "-xS", "-xN", str(width), "-xW", str(height)]
-        result = _run_obabel(cmd, timeout=60)
+        # 2D 渲染有时很慢，使用 OB_PNG_TIMEOUT_SEC
+        result = _run_obabel(cmd, timeout=OB_PNG_TIMEOUT_SEC)
         if result.returncode == 0 and os.path.exists(output_path):
             return {"success": True, "message": "2D PNG 渲染成功（obabel CLI）", "output_path": output_path}
         else:

@@ -103,7 +103,11 @@ class Controller:
                 self.app.after(0, _after)
             except Exception as e:
                 import traceback
-                self.app.after(0, lambda: self.helpers.on_log(f"❌ 扫描失败: {e}\n{traceback.format_exc()}", 'error'))
+                # 提前获取异常对象和堆栈字符串，避免 lambda 延迟绑定取到已被清理的 e
+                err_obj = e
+                err_tb = traceback.format_exc()
+                self.app.after(0, lambda _e=err_obj, _tb=err_tb:
+                               self.helpers.on_log(f"❌ 扫描失败: {_e}\n{_tb}", 'error'))
         self.helpers.run_task(_scan)
 
     # ----- 修复 -----
@@ -429,7 +433,9 @@ class Controller:
             import openbabel_utils as obu
             from pathlib import Path
             total = len(paths)
+            ok, fail = 0, 0
             for i, (iid, fpath) in enumerate(paths, 1):
+                name = Path(fpath).name
                 try:
                     res = obu.calculate_descriptors(fpath)
                     if res.get("success"):
@@ -446,12 +452,28 @@ class Controller:
                             vals["TPSA"] = f"{tp:.2f}"
                         if vals:
                             self.app.after(0, lambda _iid=iid, _v=vals: _write_cols(_iid, _v))
+                            ok += 1
+                        else:
+                            fail += 1
+                            msg = f"描述符失败（无有效字段）{name}: {res.get('message') or 'descriptors 全部为空'}"
+                            if _log:
+                                _log(msg, level="warning")
+                            logger.warning(msg)
+                    else:
+                        fail += 1
+                        msg = f"描述符失败 {name}: {res.get('message') or '未知原因'}"
+                        if _log:
+                            _log(msg, level="warning")
+                        logger.warning(msg)
                 except Exception as e:
+                    fail += 1
+                    msg = f"描述符异常 {name}: {e}"
                     if _log:
-                        _log(f"描述符失败 {Path(fpath).name}: {e}", level="debug")
+                        _log(msg, level="warning")
+                    logger.warning(msg, exc_info=True)
                 if _progress:
-                    _progress(i, total, f"描述符计算中 {i}/{total}")
-            return {"count": total}
+                    _progress(i, total, f"描述符计算中 {i}/{total}（成功{ok}，失败{fail}）")
+            return {"count": total, "ok": ok, "fail": fail}
 
         def _write_cols(iid, v):
             try:
@@ -460,10 +482,22 @@ class Controller:
             except Exception:
                 pass
 
-        tm.run_async(_task, on_done=lambda r: (self.app.after(0, lambda:
-            self.app.helpers.on_log(
-                f"✅ 批量描述符完成：{r.get('count', 0)} 个文件（MW/LogP/TPSA 已写入表格对应列）",
-                "success"))))
+        def _on_done(r):
+            def _do():
+                total = r.get('count', 0)
+                ok = r.get('ok', 0)
+                fail = r.get('fail', 0)
+                if fail == 0:
+                    self.app.helpers.on_log(
+                        f"✅ 批量描述符完成：共 {total} 个文件，成功 {ok} 个（MW/LogP/TPSA 已写入表格对应列）",
+                        "success")
+                else:
+                    self.app.helpers.on_log(
+                        f"⚠️ 批量描述符完成：共 {total} 个文件，成功 {ok} / 失败 {fail}（详情见 WARNING 日志）",
+                        "warning")
+            self.app.after(0, _do)
+
+        tm.run_async(_task, on_done=_on_done)
 
     def _get_paths_for_descriptor(self, only_selected: bool = False) -> list[tuple[str, str]]:
         """返回 [(iid, absolute_path)] 列表用于批量算描述符"""

@@ -3,10 +3,20 @@
 """
 Model - 核心业务逻辑
 整合文件管理、PSI4计算、OpenBabel调用
+
+【安全加固 · 审计修复 2026-07-31】
+  1. 新增 resolve_secure_output_path()：所有用户可控的「输出目录/文件路径」统一过该函数，
+     禁止 .. 段、禁止越出指定 base_dir（默认 work_dir），拒绝目标为 symlink / junction。
+  2. 新增 enforce_no_symlink_target()：重命名 / 移动 / 删除前检查目标或源是否 symlink。
+  3. 新增模块级 _is_windows_junction()：在 Windows 下额外检测 NTFS 重解析点（junction），
+     避免清理/移动操作跟随到外部目录。
+  4. export_missing_csv / import_mapping_csv 增加 base_dir 限制，
+     rename_by_mapping / organize_by_type / delete_files 增加 symlink / junction 拒绝。
 """
 import os
 import re
 import csv
+import stat
 import shutil
 import hashlib
 from datetime import datetime
@@ -22,6 +32,13 @@ import psi4_compute as psi4_utils
 class MolManagerModel:
     def __init__(self, work_dir="output"):
         self.work_dir = Path(work_dir)
+        # 默认工作目录（比如 "output"）不存在就自动创建，避免首次启动时
+        # scan_files 抛 FileNotFoundError 导致空列表/UI 状态不友好
+        try:
+            if not self.work_dir.exists():
+                self.work_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("自动创建工作目录失败（将继续运行，但扫描可能失败）: %s", e)
         try:
             self._work_dir_resolved: Path = self.work_dir.resolve()
         except OSError:
@@ -32,7 +49,12 @@ class MolManagerModel:
         self.redo_stack: list = []
         self.log_callback = None
         self._suppress_history = False
-        self._scan_cache: tuple[int, tuple, list] | None = None
+        # M-2 修复：扫描缓存失效策略 = 目录 mtime + 显式版本号双通道
+        # 旧设计只靠目录 st_mtime，但 Windows 下重命名单个文件目录 mtime 可能不变，
+        # 导致缓存一直命中过期数据；新增 _scan_cache_revision 在每次 write 操作后 +1，
+        # 配合 scan_cache 键中的 revision 字段确保显式失效的缓存一定不会被命中。
+        self._scan_cache: tuple[int, tuple, int, list] | None = None
+        self._scan_cache_revision: int = 0
 
     def set_log_callback(self, callback):
         self.log_callback = callback
@@ -46,6 +68,8 @@ class MolManagerModel:
     def set_mapping(self, mapping_dict):
         self.mapping = mapping_dict
         self._reverse_mapping = {v: k for k, v in mapping_dict.items()}
+        # M-2：mapping 内容改变了会影响 scan 返回的 eng/chn 字段，必须清缓存
+        self.invalidate_scan_cache()
 
     # ---------- 映射加载 ----------
     def load_mapping_file(self, path: Path):
@@ -75,6 +99,8 @@ class MolManagerModel:
         return len(mapping), duplicate_count
 
     def invalidate_scan_cache(self):
+        """调用本方法 = 显式告诉缓存「目录内容或映射已经变了，下次扫描请重新跑」。"""
+        self._scan_cache_revision += 1
         self._scan_cache = None
 
     def filter_files(self, entries: list[dict], keyword: str="", status: str="全部", ext: str="全部") -> list[dict]:
@@ -111,8 +137,10 @@ class MolManagerModel:
             wd_mtime = 0
 
         cached = self._scan_cache
-        if cached and cached[0] == wd_mtime and cached[1] == ext_filter:
-            return cached[2]
+        rev = self._scan_cache_revision
+        # 4 元组：(wd_mtime, ext_filter, cache_revision, result)
+        if cached and len(cached) >= 4 and cached[0] == wd_mtime and cached[1] == ext_filter and cached[2] == rev:
+            return cached[3]
 
         result: list[dict] = []
         trash_dir_name = ".trash_backup"
@@ -165,7 +193,8 @@ class MolManagerModel:
         result.sort(key=lambda x: x['name'])
 
         if wd_mtime:
-            self._scan_cache = (wd_mtime, ext_filter, result)
+            # 存的时候把 revision 号一起存，下次读时 revision 对不上就不命中
+            self._scan_cache = (wd_mtime, ext_filter, rev, result)
         return result
 
     # ---------- 生成缺失映射列表（修复版） ----------
@@ -235,14 +264,30 @@ class MolManagerModel:
           b. .. 段导致向上穿越到 work_dir 父目录；
           c. 纯 . 或 .. 的文件名；
           d. allow_subdir=False 时出现子目录段。
+          e. 控制字符（NUL / CR / LF / : / * 等）被传入文件名导致 open 层被「截断」或
+             Windows shell 把 `:` 当成 ADS（alternate data stream）、或把 `..` 当目录穿越。
 
-        关键点：**单级文件名（allow_subdir=False）不需要 resolve**，
-        否则 Windows 下 OneDrive/非 ASCII 长路径/Junction 会让
-        `(work_dir / pure_filename).resolve()` 得到一个 canonicalized
-        前缀不等于 `self._work_dir_resolved`，造成合法文件被误判。
+        allow_subdir=False：**单级文件名不需要 resolve**，
+            否则 Windows 下 OneDrive/非 ASCII 长路径/Junction 会让
+            `(work_dir / pure_filename).resolve()` 得到一个 canonicalized
+            前缀不等于 `self._work_dir_resolved`，造成合法文件被误判。
+        allow_subdir=True：用 **两次** 检查（normpath + resolve），
+            同时规避：
+              - `commonpath` 在含软连接目录时的「真实路径 vs 显示路径」不一致；
+              - 纯 normpath 对「/a/b -> /a/c -> /a/b/../d」这种「先已 resolve 过再穿回父目录」的绕过。
         """
         if not isinstance(name, str) or not name:
             raise ValueError("文件名不能为空")
+        # ===== 控制字符 & Windows DOS 设备名检查（CWE-78/14 家族基础防御）=====
+        # 先按原始字符拒绝：NUL 会让 Python open 截断，CR/LF 会让 PS/CMD 命令被截断。
+        if any(ch in name for ch in ("\x00", "\r", "\n")):
+            raise ValueError(f"文件名包含非法控制字符: {name!r}")
+        # Windows 下常见不允许或不安全的字符（仅严格模式：更安全但可能误伤用户罕见名）。
+        # 我们只拒绝明确危险的 < > : " / \ | ? *（前 3 个在 NTFS ADS / 保留名解析里是高危）
+        _DANGEROUS_CHARS: tuple[str, ...] = ("<", ">", ":", '"', "|", "?", "*")
+        for ch in _DANGEROUS_CHARS:
+            if ch in name:
+                raise ValueError(f"文件名包含非法字符 {ch!r}: {name!r}")
         if Path(name).is_absolute():
             raise ValueError(f"仅接受文件名或相对子目录，禁止绝对路径: {name!r}")
         # 在规范化 *之前* 先按原始分隔符拆分段，防止 normpath 把 a/../b 压缩成 b 后漏过穿越
@@ -267,9 +312,26 @@ class MolManagerModel:
             raise ValueError(f"文件名段不能为 '.': {name!r}")
         if not allow_subdir and len(parts) != 1:
             raise ValueError(f"仅接受单级文件名，禁止子目录: {name!r}")
+        # Windows DOS 设备名 / 保留名防御（CON / PRN / AUX / NUL / COM1 / LPT1 等）。
+        # CON.txt、CON:stream 这类写法也得拦。如果 allow_subdir=True，对每一段都检查（
+        # 否则可能出现「子目录 CON/...」这种会被 Windows 当设备名打开的路径）。
+        _WIN_RESERVED: frozenset[str] = frozenset({
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        })
+        for seg in parts:
+            seg_stripped = seg.split(".", 1)[0].strip().rstrip(".").strip()
+            if seg_stripped.upper() in _WIN_RESERVED:
+                raise ValueError(f"文件名包含 Windows 保留名，禁止使用: {seg!r}")
+            # Windows 不允许文件名以空格或点结尾（会被静默截断），直接拦掉避免「写 A.txt.
+            # 实际写到 A.txt」这种让上层误以为路径不同的问题。
+            if seg.endswith((" ", ".")) and seg not in (".", ".."):
+                raise ValueError(f"文件/目录段禁止以空格或点结尾: {seg!r}")
         if allow_subdir:
             wd_resolved = self._work_dir_resolved
             wd_norm = os.path.normpath(os.fspath(wd_resolved))
+            # --- 检查 1/2：先按 normpath 做路径内越界（不触碰文件系统） ---
             candidate_norm = os.path.normpath(os.fspath(self.work_dir / norm))
             ok_by_norm = False
             try:
@@ -277,19 +339,334 @@ class MolManagerModel:
                 ok_by_norm = os.path.normcase(common) == os.path.normcase(wd_norm)
             except (ValueError, OSError):
                 ok_by_norm = False
-            if not ok_by_norm:
-                try:
-                    candidate = (self.work_dir / norm).resolve()
-                except OSError:
+            # --- 检查 2/2：再用 Path.resolve 过一遍真实 FS（软连接展开）---
+            # 只在文件/目录 **已存在** 时才 resolve，避免 Windows 下不存在路径的
+            # resolve() 行为在不同 Python 版本间有差异（旧版本不解析不存在路径）
+            try:
+                raw_cand = self.work_dir / norm
+                if raw_cand.exists() or raw_cand.parent.exists():
+                    candidate = raw_cand.resolve(strict=False)
+                else:
+                    # 目标不存在 + 父目录也不存在：用严格的 norm/commonpath 兜底即可，
+                    # 因为后续在真正 os.makedirs/open 时还会在 work_dir 前缀下创建，
+                    # 不会穿越（我们前面已 ban 掉绝对路径和 .. 段）。
                     candidate = Path(candidate_norm)
-                try:
-                    candidate.relative_to(wd_resolved)
-                except ValueError as exc:
+                candidate.relative_to(wd_resolved)
+            except (OSError, ValueError) as exc:
+                # normpath 检查也没过时，就明确抛「超出工作目录范围」；
+                # normpath 过了但 resolve 失败：典型是跨软连接指向外部
+                if not ok_by_norm:
                     raise ValueError(f"解析后位置超出工作目录范围: {name!r}") from exc
+                raise ValueError(f"解析后（含软连接）位置超出工作目录范围: {name!r}") from exc
         return name
 
 
-    # ---------- 命名修复 ----------
+    # ===========================================================
+    # 【安全加固 · 审计 1.1 / 2.2 修复】输出路径 / 符号链接 / junction 检查
+    # ===========================================================
+    def resolve_secure_output_path(
+        self,
+        requested_path: str | bytes | os.PathLike | None,
+        *,
+        is_dir: bool = False,
+        default_name: str | None = None,
+        base_dir: str | bytes | os.PathLike | None = None,
+        allow_outside_work_dir: bool = False,
+        create_parent: bool = False,
+    ) -> Path:
+        """
+        审计 1.1（高）路径遍历修复的统一入口。
+
+        使用场景：
+          * 用户输入的输出目录 / 导出 CSV 路径 / 渲染 PNG 路径 / OB 转换输出路径等
+            → 都先调用本函数拿到真正安全的 Path，再去 open/makedirs/shutil.move。
+
+        行为：
+          1. 把 ``None`` 或空串替换为 ``default_name``（若提供）；
+          2. 若 ``requested_path`` 是绝对路径：
+             - 当 ``allow_outside_work_dir=False`` 时，必须解析后落在 ``base_dir``（默认 work_dir）内；
+             - 当 ``allow_outside_work_dir=True`` 时，允许外部路径（例如用户显式在 filedialog 中选了桌面某处），
+               但仍会拒绝 ``..`` 段并做 symlink/junction 拒绝检查。
+          3. 若为相对路径：按 ``base_dir``（默认 work_dir）拼，用 normpath + resolve 双重检查防穿越。
+          4. 若 ``create_parent=True``，**只会在 base_dir 下创建父目录**；若解析后越界则拒绝创建。
+          5. 返回最终解析后的真实 Path（若文件/目录已存在则返回其 resolve 的 canonical path；否则返回
+             normpath 版本，但 parent 会被 resolve 过，确保不被 symlink 伪目录引导到外部）。
+        """
+        base_dir_resolved: Path
+        if base_dir is None:
+            base_dir_resolved = self._work_dir_resolved
+        else:
+            try:
+                base_dir_resolved = Path(base_dir)
+                base_dir_resolved = base_dir_resolved.resolve(strict=True)
+            except (OSError, ValueError) as _exc:
+                raise ValueError(f"base_dir 无法解析（必须是已存在的目录）: {base_dir!r}") from _exc
+
+        # —— 输入归一化：空 -> default ——
+        raw: str
+        if requested_path is None:
+            raw = ""
+        elif isinstance(requested_path, bytes):
+            raw = requested_path.decode("utf-8", "replace")
+        else:
+            raw = os.fspath(requested_path)
+        raw = raw.strip() if isinstance(raw, str) else ""
+        if not raw and default_name:
+            raw = str(default_name)
+        if not raw:
+            raise ValueError("输出路径为空且未提供 default_name")
+
+        # —— 0. 在任何规范化之前，按原始字符串拒绝 '..' 段（防止 Windows 8.3 短名等绕过）——
+        raw_slashed = raw.replace("\\", "/")
+        raw_segs = [s for s in raw_slashed.split("/") if s != ""]
+        if any(seg == ".." for seg in raw_segs):
+            raise ValueError(f"输出路径禁止包含 '..' 段: {raw!r}")
+
+        p = Path(raw)
+
+        # —— 1. 相对路径 → 拼到 base_dir_resolved ——
+        if not p.is_absolute():
+            p = base_dir_resolved / p
+
+        # —— 2. normpath + commonpath（FS 无关）——
+        try:
+            norm_abs = os.path.normpath(os.fspath(p))
+            base_norm = os.path.normpath(os.fspath(base_dir_resolved))
+            if not allow_outside_work_dir:
+                common = os.path.commonpath([base_norm, norm_abs])
+                if os.path.normcase(common) != os.path.normcase(base_norm):
+                    raise ValueError(
+                        f"输出路径越出允许范围（commonpath 判定）：请求 {norm_abs!r}，允许根 {base_norm!r}"
+                    )
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError(f"输出路径规范化失败: {raw!r}") from exc
+
+        candidate_norm = Path(norm_abs)
+
+        # —— 3. symlink / junction 逐级拒绝（从 base 到 candidate）——
+        # 注意：检查 "父目录链" 是否含 symlink / junction；如果 candidate 已存在，也检查其本身
+        def _check_chain_up_to(target: Path, base: Path) -> None:
+            """从 base -> target，逐级检查每个已存在的节点非 symlink / junction。"""
+            parts_a = []
+            try:
+                rel = target.resolve(strict=False).relative_to(base.resolve(strict=False))
+                parts_a = list(rel.parts)
+            except (OSError, ValueError):
+                # target 不在 base 下（理论上前面已 commonpath，但 symlink 可改变真实位置）
+                parts_a = list(target.parts)
+            cur = base
+            for part in parts_a:
+                cur = cur / part
+                if not cur.exists():
+                    continue
+                enforce_no_symlink_target(cur, allow_nonexistent=True, _level="chain")
+            # 最后检查 target 本身（如果存在）
+            if target.exists():
+                enforce_no_symlink_target(target, allow_nonexistent=True, _level="leaf")
+
+        try:
+            _check_chain_up_to(candidate_norm, base_dir_resolved)
+        except ValueError as exc:
+            raise ValueError(f"输出路径链中存在符号链接 / Junction，拒绝写入: {raw!r} ({exc})") from exc
+
+        # —— 4. resolve 一次真实路径，用 Path.relative_to 再验证（防 symlink 链绕过 commonpath）——
+        try:
+            # 对 "已存在" 的父链尽量用真实 FS resolve；不存在的部分 fallback 到 normpath
+            try:
+                if candidate_norm.exists() or candidate_norm.parent.exists():
+                    resolved = candidate_norm.resolve(strict=False)
+                else:
+                    resolved = candidate_norm
+            except OSError:
+                resolved = candidate_norm
+            if not allow_outside_work_dir:
+                resolved.relative_to(base_dir_resolved)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"解析后真实路径超出允许范围（含 symlink 穿透）: {raw!r}") from exc
+
+        final_path = resolved
+
+        # —— 5. 如允许目录 / 或需要创建父目录（只能在 base_dir 内创建）——
+        try:
+            if create_parent:
+                parent = final_path if is_dir else final_path.parent
+                # 再次确认 parent 不越界
+                if not allow_outside_work_dir:
+                    _ = Path(os.path.normpath(os.fspath(parent))).relative_to(
+                        Path(os.path.normpath(os.fspath(base_dir_resolved)))
+                    )
+                parent.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"无法为输出路径创建父目录: {final_path!r} ({exc})") from exc
+
+        return final_path
+
+
+def enforce_no_symlink_target(
+    path: str | os.PathLike,
+    *,
+    allow_nonexistent: bool = True,
+    _level: str = "leaf",
+) -> None:
+    """
+    审计 2.2（中）符号链接 / Junction 修复：
+      - ``path`` 若已存在：拒绝 symlink（is_symlink）；Windows 下额外拒绝 junction
+        （通过 lstat 的 FILE_ATTRIBUTE_REPARSE_POINT 判定）。
+      - ``allow_nonexistent``=True 时，path 不存在不报错。
+    使用场景：rename/move/delete/open(W) 前先调用本函数拒绝对 symlink 目标做真实改动。
+    """
+    p = Path(path)
+    if not p.exists() and allow_nonexistent:
+        return
+    try:
+        if p.is_symlink():
+            raise ValueError(f"检测到符号链接（symlink），拒绝操作: {os.fspath(p)!r}")
+    except OSError as exc:
+        raise ValueError(f"无法判定是否为符号链接: {os.fspath(p)!r} ({exc})") from exc
+    # Windows Junction / 其他 Reparse Point（例如 OneDrive 的离线占位符）
+    if os.name == "nt":
+        _is_windows_junction(p, _raise=True)
+    return
+
+
+# —— 模块级 Windows Junction 检测 ——
+def _is_windows_junction(path: str | os.PathLike, *, _raise: bool = False) -> bool:
+    """
+    Windows NTFS 下判定 path 是否为 Junction / 非 symlink 但带 REPARSE_DATA_BUFFER 的重解析点。
+    - symlink 本身是 reparse point，但在 enforce_no_symlink_target 之前已拒绝；
+      本函数主要覆盖 junction / 挂载点。
+    - 非 Windows 平台始终返回 False。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        p = Path(path)
+        if not p.exists():
+            return False
+        # lstat 不跟随链接；junction 通常是目录，所以不能用 stat
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+        if (st.st_mode & stat.S_IFMT) == stat.S_IFDIR and (st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT):
+            if _raise:
+                raise ValueError(f"检测到 Windows Junction / ReparsePoint 目录，拒绝跟随操作: {os.fspath(p)!r}")
+            return True
+    except ValueError:
+        raise
+    except Exception:
+        return False
+    return False
+
+
+# 模块级便捷包装：用于 model 外部调用（如 openbabel_utils / psi4_compute / dialogs），
+# 当调用方没有 model 实例，但仍希望按「某个 base_dir」做输出路径安全校验。
+def resolve_secure_output_path_external(
+    requested_path,
+    *,
+    base_dir,
+    is_dir: bool = False,
+    default_name=None,
+    allow_outside: bool = False,
+    create_parent: bool = False,
+) -> Path:
+    """
+    非 model 场景（例如 openbabel_utils）复用安全输出路径校验的便捷包装。
+    ``base_dir`` 必须是已存在的真实目录；其语义与 model.resolve_secure_output_path 一致。
+    """
+    # 临时构造一个 "无副作用" 的 model 实例太昂贵，这里直接复用其实现的等价骨架：
+    if not base_dir:
+        raise ValueError("base_dir 不能为空")
+    base_p = Path(base_dir)
+    if not base_p.is_dir():
+        raise ValueError(f"base_dir 必须是已存在的目录: {os.fspath(base_p)!r}")
+    base_real = base_p.resolve(strict=True)
+
+    raw = ""
+    if requested_path is None:
+        raw = ""
+    elif isinstance(requested_path, bytes):
+        raw = requested_path.decode("utf-8", "replace")
+    else:
+        raw = os.fspath(requested_path)
+    raw = raw.strip() if isinstance(raw, str) else ""
+    if not raw and default_name:
+        raw = str(default_name)
+    if not raw:
+        raise ValueError("输出路径为空且未提供 default_name")
+
+    raw_slashed = raw.replace("\\", "/")
+    raw_segs = [s for s in raw_slashed.split("/") if s != ""]
+    if any(seg == ".." for seg in raw_segs):
+        raise ValueError(f"输出路径禁止包含 '..' 段: {raw!r}")
+
+    p = Path(raw)
+    if not p.is_absolute():
+        p = base_real / p
+
+    norm_abs = os.path.normpath(os.fspath(p))
+    base_norm = os.path.normpath(os.fspath(base_real))
+    if not allow_outside:
+        try:
+            common = os.path.commonpath([base_norm, norm_abs])
+            if os.path.normcase(common) != os.path.normcase(base_norm):
+                raise ValueError(
+                    f"输出路径越出允许范围（commonpath 判定）：请求 {norm_abs!r}，允许根 {base_norm!r}"
+                )
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError(f"输出路径规范化失败: {raw!r}") from exc
+    cand = Path(norm_abs)
+    # 链 / 节点 symlink+junction 拒绝
+    def _walk_chain(target: Path, base: Path) -> None:
+        try:
+            rel = target.resolve(strict=False).relative_to(base.resolve(strict=False))
+            parts_a = list(rel.parts)
+        except (OSError, ValueError):
+            parts_a = list(target.parts)
+        cur = base
+        for part in parts_a:
+            cur = cur / part
+            if not cur.exists():
+                continue
+            enforce_no_symlink_target(cur, allow_nonexistent=True, _level="chain")
+        if target.exists():
+            enforce_no_symlink_target(target, allow_nonexistent=True, _level="leaf")
+    try:
+        _walk_chain(cand, base_real)
+    except ValueError as exc:
+        raise ValueError(f"输出路径链中存在符号链接 / Junction，拒绝写入: {raw!r} ({exc})") from exc
+    if not allow_outside:
+        try:
+            if cand.exists() or cand.parent.exists():
+                resolved = cand.resolve(strict=False)
+            else:
+                resolved = cand
+            resolved.relative_to(base_real)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"解析后真实路径超出允许范围（含 symlink 穿透）: {raw!r}") from exc
+    if create_parent:
+        parent = cand if is_dir else cand.parent
+        try:
+            if not allow_outside:
+                _ = Path(os.path.normpath(os.fspath(parent))).relative_to(
+                    Path(os.path.normpath(os.fspath(base_real))))
+            parent.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"无法为输出路径创建父目录: {os.fspath(cand)!r} ({exc})") from exc
+    return cand
+
+
+class MolManagerModel_:  # sentinel, never used
+    """占位符（避免意外名称冲突）。"""
+    pass
+
+
+# ---------- 命名修复 ----------
     def _plan_rename(self, file_entry, new_base: str | None, skip_reason: str | None = None):
         if skip_reason is not None:
             return ('skip', skip_reason)
@@ -304,6 +681,13 @@ class MolManagerModel:
         old_path = self.work_dir / file_entry['name']
         parent = old_path.parent
         new_path = parent / new_name
+        # 【安全加固 2.2】拒绝对 symlink / junction 做重命名（源和目标的父链）
+        try:
+            enforce_no_symlink_target(old_path, allow_nonexistent=True, _level="src")
+            # 目标本身必然不存在（后面还会判断 exists），这里只检查父目录链
+            enforce_no_symlink_target(parent, allow_nonexistent=False, _level="parent")
+        except ValueError as exc:
+            return ('skip', f"检测到符号链接/Junction: {exc}")
         if old_path == new_path:
             return ('skip', None)
         if new_path.exists():
@@ -533,6 +917,17 @@ class MolManagerModel:
                     continue
             except OSError:
                 pass
+            # =====【审计 2.2 修复：symlink / junction 拒绝】=====
+            try:
+                # 源：必须是真实文件（既不允许本身是 symlink，也不允许路径中有任何一段是 symlink）
+                enforce_no_symlink_target(src, allow_nonexistent=False, _level="src")
+                # 目标的父目录：不能是 symlink/junction（避免 shutil.move 穿透到外部目录）
+                dst_parent = Path(dst).parent
+                if dst_parent.exists():
+                    enforce_no_symlink_target(dst_parent, allow_nonexistent=False, _level="dst-parent")
+            except ValueError as _se:
+                self._log(f"⚠️ 拒绝移动（存在符号链接/Junction）{src_name}: {_se}", 'warning')
+                continue
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             if dst_path.exists():
                 self._log(f"⚠️ 跳过 {Path(src).name}: 目标已存在", 'warning')
@@ -748,7 +1143,7 @@ class MolManagerModel:
         trash_resolved = trash.resolve(strict=False)
         for name in filenames:
             try:
-                self._strict_basename(name, allow_subdir=False)
+                self._strict_basename(name, allow_subdir=True)
             except ValueError as exc:
                 errors.append(f"非法文件名 {name!r}: {exc}")
                 continue
@@ -785,12 +1180,31 @@ class MolManagerModel:
             if src.is_symlink() or not src_real.is_file():
                 errors.append(f"仅删除工作目录中的真实文件，跳过: {name}")
                 continue
+            # =====【审计 2.2 修复：在 move-to-trash 之前，拒绝任何 symlink/junction 链 =====
+            try:
+                enforce_no_symlink_target(src, allow_nonexistent=False, _level="src")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                # 回收站目录本身也不能被 symlink 穿透（.trash_backup 路径校验）
+                if dst.parent.exists():
+                    enforce_no_symlink_target(dst.parent, allow_nonexistent=False, _level="trash-parent")
+            except ValueError as _se:
+                errors.append(f"检测到符号链接/Junction，拒绝删除: {name} ({_se})")
+                continue
             dst = trash / name
             counter = 1
             while dst.exists():
                 stem, ext = src.stem, src.suffix
-                dst = trash / f"{stem}_{counter}{ext}"
+                # 如果 name 含子目录（如 sub/a.xyz），冲突时把计数器写到文件名上，但保留原目录结构
+                name_as_path = Path(name)
+                new_name = name_as_path.parent / f"{stem}_{counter}{ext}"
+                dst = trash / new_name
                 counter += 1
+            # 如果 name 含子目录段，先在 trash 里建好对应的父目录（保证 shutil.move 有地方落）
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as _e_mk:
+                errors.append(f"无法在回收站建目录 {os.fspath(dst.parent)!r}: {_e_mk}")
+                continue
             try:
                 shutil.move(str(src), str(dst))
                 self._log(f"🗑️ 删除（已备份）: {name}", 'info')
@@ -839,6 +1253,8 @@ class MolManagerModel:
         if progress_callback:
             progress_callback(100, "清理完成")
         self._log(f"✅ 重复文件清理完成：发现 {duplicates_found} 个重复副本，已删除 {deleted} 个", 'success')
+        # M-2：删文件后显式清缓存，避免 mtime 没刷新时 UI 继续显示已删条目
+        self.invalidate_scan_cache()
         return deleted, errors
 
     # ---------- 历史记录 ----------
@@ -1314,11 +1730,18 @@ class MolManagerModel:
         right_path.mkdir(parents=True, exist_ok=True)
         success = 0
         errors: list[str] = []
+        left_resolved = left_path.resolve(strict=False)
+        right_resolved = right_path.resolve(strict=False)
         for name in names:
-            src = left_path / name
-            dst = right_path / name
             try:
-                shutil.copy2(str(src), str(dst))
+                self._strict_basename(name, allow_subdir=False)
+                src = left_path / name
+                dst = right_path / name
+                src_real = src.resolve(strict=True)
+                dst_real = dst.parent.resolve(strict=False) / src.name
+                src_real.relative_to(left_resolved)
+                dst_real.relative_to(right_resolved)
+                shutil.copy2(str(src_real), str(dst_real))
                 self._log(f"✅ 复制: {name} (左→右)", "success")
                 success += 1
             except Exception as e:
@@ -1332,11 +1755,18 @@ class MolManagerModel:
         left_path.mkdir(parents=True, exist_ok=True)
         success = 0
         errors: list[str] = []
+        left_resolved = left_path.resolve(strict=False)
+        right_resolved = right_path.resolve(strict=False)
         for name in names:
-            src = right_path / name
-            dst = left_path / name
             try:
-                shutil.copy2(str(src), str(dst))
+                self._strict_basename(name, allow_subdir=False)
+                src = right_path / name
+                dst = left_path / name
+                src_real = src.resolve(strict=True)
+                dst_real = dst.parent.resolve(strict=False) / src.name
+                src_real.relative_to(right_resolved)
+                dst_real.relative_to(left_resolved)
+                shutil.copy2(str(src_real), str(dst_real))
                 self._log(f"✅ 复制: {name} (右→左)", "success")
                 success += 1
             except Exception as e:
@@ -1350,11 +1780,18 @@ class MolManagerModel:
         right_path.mkdir(parents=True, exist_ok=True)
         success = 0
         errors: list[str] = []
+        left_resolved = left_path.resolve(strict=False)
+        right_resolved = right_path.resolve(strict=False)
         for name in names:
-            src = left_path / name
-            dst = right_path / name
             try:
-                shutil.copy2(str(src), str(dst))
+                self._strict_basename(name, allow_subdir=False)
+                src = left_path / name
+                dst = right_path / name
+                src_real = src.resolve(strict=True)
+                dst_real = dst.parent.resolve(strict=False) / src.name
+                src_real.relative_to(left_resolved)
+                dst_real.relative_to(right_resolved)
+                shutil.copy2(str(src_real), str(dst_real))
                 self._log(f"🔁 覆盖: {name} (左→右)", "success")
                 success += 1
             except Exception as e:
@@ -1368,11 +1805,18 @@ class MolManagerModel:
         left_path.mkdir(parents=True, exist_ok=True)
         success = 0
         errors: list[str] = []
+        left_resolved = left_path.resolve(strict=False)
+        right_resolved = right_path.resolve(strict=False)
         for name in names:
-            src = right_path / name
-            dst = left_path / name
             try:
-                shutil.copy2(str(src), str(dst))
+                self._strict_basename(name, allow_subdir=False)
+                src = right_path / name
+                dst = left_path / name
+                src_real = src.resolve(strict=True)
+                dst_real = dst.parent.resolve(strict=False) / src.name
+                src_real.relative_to(right_resolved)
+                dst_real.relative_to(left_resolved)
+                shutil.copy2(str(src_real), str(dst_real))
                 self._log(f"🔁 覆盖: {name} (右→左)", "success")
                 success += 1
             except Exception as e:

@@ -195,8 +195,8 @@ class AppHelpers:
                     self.app.log_text.configure(state="normal")
                     self.app.log_text.delete("1.0", tk.END)
                     self.app.log_text.configure(state="disabled")
-                except Exception:
-                    pass
+                except Exception as _cle:
+                    logger.debug("日志面板直接清空失败: %s", _cle)
             logger.info("📋 日志面板已清空")
         except Exception as e:
             logger.error("清空日志失败: %s", e)
@@ -232,7 +232,8 @@ class AppHelpers:
             self.app.status_var.set(f"处理中... {percent:.0f}%")
         if percent >= 100:
             self.app.status_var.set("就绪")
-            self.app.after(1000, lambda: self.app.progress_var.set(0))
+            # 1 秒后把进度条归 0：用默认参数把 progress_var 绑定住，避免后续回调里 self/app 指向变化
+            self.app.after(1000, lambda pv=self.app.progress_var: pv.set(0))
 
 
     # ---------- 提交任务 ----------
@@ -261,14 +262,39 @@ class AppHelpers:
             var.set(d)
 
     # ---------- 更新文件树 ----------
+    # 问题4修复：Treeview 分批插入（每批 200 行 + after_idle 让出 UI 事件循环），
+    # 避免一次性 insert 几千条导致 GUI 卡死。
+    _RENDER_BATCH_SIZE = 200
+
     def render_files(self, entries: list):
         self.app.current_files = entries
-        for item in self.app.tree.get_children():
-            self.app.tree.delete(item)
-        for f in entries:
-            self.app.tree.insert("", tk.END, values=(f['name'], f['status'], f['eng'], f['chn']))
+        # 一次性清空（delete 对几万条仍是 O(N)，但比逐条 insert 快得多）
+        children = self.app.tree.get_children()
+        if children:
+            self.app.tree.delete(*children)
         total = len(self.app.last_scan_result)
         self.app.filter_count_var.set(f"共 {len(entries)} / {total} 个")
+        if not entries:
+            return
+        # 条目很少（<= 一批）：直接插入，省掉 after 调度开销
+        if len(entries) <= self._RENDER_BATCH_SIZE:
+            for f in entries:
+                self.app.tree.insert("", tk.END,
+                                     values=(f['name'], f['status'], f['eng'], f['chn']))
+            return
+        # 分批：通过 after_idle 调度，每批插入后让出一次主线程 event loop，保持 UI 响应
+        tree = self.app.tree
+        END = tk.END
+
+        def _insert_batch(start_i: int):
+            end_i = min(start_i + self._RENDER_BATCH_SIZE, len(entries))
+            for idx in range(start_i, end_i):
+                f = entries[idx]
+                tree.insert("", END, values=(f['name'], f['status'], f['eng'], f['chn']))
+            if end_i < len(entries):
+                self.app.after_idle(_insert_batch, end_i)
+
+        self.app.after_idle(_insert_batch, 0)
 
     def apply_filter(self):
         keyword = self.app.filter_keyword_var.get()
@@ -301,6 +327,22 @@ class AppHelpers:
             if values:
                 selected.append(values[0])
         return selected
+
+    def get_selected_files(self) -> list[str]:
+        """返回选中文件的完整路径列表（绝对/工作目录下的规范化路径）。"""
+        work_dir = self.app.controller.model.work_dir
+        names = self.get_selected_filenames()
+        # 用 _strict_basename 先过一遍路径校验，避免 UI 上意外出现越界路径
+        safe: list[str] = []
+        for n in names:
+            try:
+                # 允许子目录（扫描可能选中子目录中的条目）
+                sanitized = self.app.controller.model._strict_basename(n, allow_subdir=True)
+            except Exception:
+                # 极少见：name 不是合法 basename；但 tree 里的值通常来自 scan_files 已经过滤了，这里兜底跳过
+                continue
+            safe.append(str(Path(work_dir) / sanitized))
+        return safe
 
     def get_selected_file_info(self):
         selected = self.get_selected_filenames()
@@ -456,7 +498,8 @@ class AppHelpers:
     def on_task_done(self, result):
         self.app.status_var.set("就绪")
         if self.app.progress_var.get() >= 100:
-            self.app.after(1000, lambda: self.app.progress_var.set(0))
+            # 用默认参数绑定 progress_var，避免 lambda 延迟时 self/app 变化
+            self.app.after(1000, lambda pv=self.app.progress_var: pv.set(0))
 
     def on_task_error(self, error):
         self.app.status_var.set("出错")
@@ -477,3 +520,126 @@ class AppHelpers:
                 _mb2.showerror("出错啦", f"后台任务出错：\n{error}\n\n可以把这段文字发给开发者。", parent=self.app)
             except Exception:
                 pass
+
+    # ---------- 环境诊断 / 状态栏指示灯同步（问题三：OB 可用性）----------
+    def check_environment(self, *,
+                          announce_missing: bool = False,
+                          show_dialog: bool = False,
+                          parent=None):
+        """
+        统一环境检查入口：
+          - 检测 OpenBabel（pybel + CLI），并更新状态栏右侧 OB 指示灯
+          - 检测 PSI4（仅检查 Python 包，不跑任务）
+          - 当 announce_missing=True 时：
+              * 若 OB 不可用 → 弹「环境诊断」对话框，让用户有机会装 / 手动设路径
+          - 当 show_dialog=True 时：无论是否出错都弹环境诊断对话框
+        返回 dict：{ob_ok, ob_msg, ob_details, psi4_ok, psi4_msg}
+        """
+        app = self.app
+        try:
+            import openbabel_utils as ob_utils
+            ob_ok, ob_msg, ob_det = ob_utils.check_openbabel()
+        except Exception as _oe:
+            ob_ok, ob_msg, ob_det = False, f"check_openbabel 抛错: {_oe}", {}
+
+        psi4_ok = False
+        psi4_msg = "未检测 PSI4"
+        try:
+            import psi4  # type: ignore
+            _v = getattr(psi4, "__version__", None)
+            psi4_ok = True
+            psi4_msg = f"psi4 已导入 (version {_v or '未声明'})"
+        except Exception as _pe:
+            psi4_msg = f"未导入 psi4（不影响文件整理与 OpenBabel 工具）: {_pe}"
+
+        # —— 同步状态栏 OB 指示灯 ——
+        try:
+            dot = getattr(app, "ob_dot_canvas", None)
+            lab = getattr(app, "ob_dot_label", None)
+            status_text = getattr(app, "ob_dot_status_var", None)
+            fill = "#0EA288" if ob_ok else ("#E5484D")
+            if dot is not None:
+                try:
+                    dot.itemconfig("dot", fill=fill, outline=fill, width=1)
+                    # 加一个小高光（更像「灯」）
+                    try:
+                        dot.delete("hl")
+                        sz = dot.winfo_width() or 18
+                        r2 = max(4, sz // 5)
+                        dot.create_oval(3, 3, 3 + r2, 3 + r2, fill="#FFFFFF",
+                                        outline="", tags="hl")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            if status_text is not None:
+                try:
+                    status_text.set(("OB 就绪" if ob_ok else "OB 未就绪"))
+                except Exception:
+                    pass
+            if lab is not None:
+                try:
+                    lab.configure(fg=(("#0EA288") if ob_ok else "#E5484D"))
+                except Exception:
+                    pass
+            # 绑定/重绑定点击 → 打开环境诊断对话框
+            def _on_ob_dot_click(*_a):
+                try:
+                    self.check_environment(announce_missing=False, show_dialog=True)
+                except Exception as _e:
+                    messagebox.showerror("打开环境诊断失败", str(_e))
+            for wid in (dot, lab):
+                if wid is not None:
+                    try:
+                        wid.bind("<Button-1>", _on_ob_dot_click, add="+")
+                    except Exception:
+                        pass
+        except Exception as _se:
+            logger.debug("更新 OB 指示灯失败：%s", _se)
+
+        # 日志（避免打扰，只在 OB 不可用且 announce 时 warn）
+        try:
+            if ob_ok:
+                logger.debug("环境检测 OK：%s", ob_msg)
+            else:
+                logger.warning("环境检测：OpenBabel 不可用：%s  （可在状态栏右侧点击指示灯，或帮助 → 环境诊断解决）",
+                               ob_msg)
+        except Exception:
+            pass
+
+        # 是否需要弹窗
+        need_dialog = bool(show_dialog)
+        if (not need_dialog) and announce_missing and (not ob_ok):
+            need_dialog = True
+        if need_dialog:
+            try:
+                # 延迟一点打开，避免与启动时的主窗口抢焦点
+                def _op():
+                    try:
+                        from dialogs import Dialogs
+                        dlg = Dialogs(app, self)
+                        try:
+                            dlg.show_environment_dialog(parent=parent or app,
+                                                        ob_details=ob_det,
+                                                        psi4_details={
+                                                            "ok": psi4_ok,
+                                                            "message": psi4_msg,
+                                                        })
+                        except Exception:
+                            pass
+                    except Exception as _de:
+                        messagebox.showerror("打开环境诊断失败", str(_de))
+                try:
+                    app.after(200, _op)
+                except Exception:
+                    _op()
+            except Exception as _de:
+                logger.warning("无法打开环境诊断对话框：%s", _de)
+
+        return {
+            "ob_ok": ob_ok,
+            "ob_msg": ob_msg,
+            "ob_details": ob_det or {},
+            "psi4_ok": psi4_ok,
+            "psi4_msg": psi4_msg,
+        }

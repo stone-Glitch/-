@@ -5,6 +5,7 @@
 """
 
 import os
+import sys
 import time
 import shutil
 import tempfile
@@ -17,7 +18,7 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
     """
     启动时清理过期的 psi4_temp_* 临时目录，返回删除的数量。
 
-    安全加固（修复 CWE-59 符号链接跟随 / CWE-367 TOCTOU）：
+    安全加固（修复 CWE-59 符号链接跟随 / CWE-367 TOCTOU / 审计 1.2 Windows junction）：
       • 仅在系统临时目录（tempfile.gettempdir / %TEMP% / TMPDIR / TMP）内匹配，
         不再触碰 Path.cwd()，避免误伤工作区或用户创建的同名目录。
       • 先用 resolve(strict=True) 拿真实路径，
@@ -26,7 +27,19 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
         避免跟随到外部目录。
       • age 检查与 rmtree 都作用在同一个 real（已 resolve）的 Path 对象上，
         缩小两次文件系统检查之间的竞争窗口。
+      • 【审计 1.2 新增】Windows 下显式检测 reparse point（junction），避免
+        Path.is_symlink 漏检 NTFS reparse point。
     """
+    def _is_windows_junction(path: Path) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            st = os.lstat(os.fspath(path))
+        except OSError:
+            return False
+        import stat
+        # IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003；junction 都是 FILE_ATTRIBUTE_REPARSE_POINT
+        return bool(getattr(st, "st_file_attributes", 0) & 0x00000400)  # FILE_ATTRIBUTE_REPARSE_POINT
     removed = 0
     roots: set[Path] = set()
     for envvar in ('TMPDIR', 'TEMP', 'TMP'):
@@ -53,10 +66,16 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
             continue
         for d in candidates:
             try:
+                # 【审计 1.2 junction 检测】先在未 resolve 的路径上用 lstat
+                if _is_windows_junction(d):
+                    continue
                 real = d.resolve(strict=True)
-            except OSError:
-                continue
-            try:
+                # resolve 之后如果本身是 symlink（极少，但防御），或原 path 是 symlink
+                if d.is_symlink() or real.is_symlink():
+                    continue
+                # 【审计 1.2 junction 检测】resolve 后的路径也跑一遍
+                if _is_windows_junction(real):
+                    continue
                 if real in seen:
                     continue
                 seen.add(real)
@@ -64,9 +83,6 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
                 try:
                     real.relative_to(root)
                 except ValueError:
-                    continue
-                # (2) 拒绝 symlink / junction
-                if d.is_symlink() or real.is_symlink():
                     continue
                 # (3) 必须是目录
                 if not real.is_dir():
@@ -146,13 +162,13 @@ class SplashScreen:
                                     outline="", fill=self._mix_with_bg("#0EA288", alpha))
         self.canvas.create_oval(mx - 5, my - 5, mx + 5, my + 5,
                                 outline="#FFFFFF", fill="#0EA288", width=1)
-        # 3 条轨道
+        # 3 条轨道（装饰性椭圆线框，用 create_oval 兼容性最好；
+        # 注意 create_oval 不支持 style/start/extent，所以直接画整椭圆）
         self._orbit_items = []
         for idx, (ry, rx, rot) in enumerate([(36, 62, 0), (48, 52, 25), (44, 64, -25)]):
             col = ["#3B6EFF", "#8B5CF6", "#0EA288"][idx]
             item = self.canvas.create_oval(mx - rx, my - ry, mx + rx, my + ry,
-                                           outline=col, width=2, style=tk.ARC,
-                                           start=0, extent=359)
+                                           outline=col, width=2)
             # 简单近似：不真的旋转椭圆，用 canvas 画点模拟电子沿轨道
             self._orbit_items.append((mx, my, rx, ry, rot, col, idx))
 
@@ -236,20 +252,190 @@ class SplashScreen:
 
 def main():
     logger.info("程序启动")
+    # M-3 修复：清理过期临时目录：改为非守护线程（daemon=False）
+    # daemon 线程会在解释器退出时被硬杀，正在 rmtree/stat 时被强杀可能留下 Fatal Python error，
+    # 且清理操作本身耗时极短（几百毫秒级），等它结束是安全的。
     try:
-        _cleanup_stale_tempdirs()
+        import threading as _th
+        _th.Thread(target=_cleanup_stale_tempdirs, daemon=False, name="TmpCleanup").start()
     except Exception as e:
-        logger.debug("清理临时目录时发生非致命错误: %s", e)
+        logger.debug("启动临时目录清理线程失败（将跳过清理）: %s", e)
     splash = SplashScreen()
 
+    def _close_splash_safely():
+        """无论哪种失败路径都关 splash，避免一个看不见的 Tk 根一直挂着导致 showerror 无父窗口"""
+        try:
+            if getattr(splash, 'root', None) is not None:
+                try:
+                    splash.close()
+                except Exception as _sc:
+                    # splash 可能已经被用户或前面的异常链关掉，兜底 destroy
+                    try:
+                        splash.root.destroy()
+                    except Exception as _sd:
+                        logger.debug("关闭 splash 失败 (destroy): %s", _sd)
+        except Exception as _sf:
+            logger.debug("关闭 splash 失败 (outer): %s", _sf)
+
+    def _destroy_any_tk_root(*exclude):
+        """
+        启动失败时清理 Tk 根：把除了 exclude 里（一般是临时用的 tmp_root）之外的
+        所有活着的 Tk 解释器都 destroy 掉，避免「半初始化的 MainView」或 splash
+        残留在内存里，导致后续 messagebox.showerror 拿一个不可见窗口做父窗口。
+        """
+        try:
+            # Tkinter 内部用 _toplevel 字典维护所有活着的 Tk/Toplevel 实例
+            all_tk = list(tk._default_root.tk.call("winfo", "children", ".")) if getattr(tk._default_root, 'tk', None) else []
+        except Exception as _we:
+            logger.debug("枚举 Tk 窗口失败: %s", _we)
+            all_tk = []
+        for w_path in all_tk:
+            try:
+                py_obj = None
+                try:
+                    # Tkinter 有个 NameToWidget 字典，路径 → Python 控件对象
+                    py_obj = getattr(tk._default_root, '_nametowidget', lambda _: None)(w_path)
+                except Exception as _nw:
+                    logger.debug("NameToWidget 失败 path=%s: %s", w_path, _nw)
+                    py_obj = None
+                if py_obj is None:
+                    continue
+                if py_obj in exclude:
+                    continue
+                try:
+                    py_obj.destroy()
+                except Exception as _de:
+                    logger.debug("destroy Tk 失败 %s: %s", w_path, _de)
+            except Exception as _le:
+                logger.debug("清理 Tk 窗口循环出错: %s", _le)
+        # 再兜底：重置 Tk 默认根
+        try:
+            tk._default_root = None  # type: ignore[attr-defined]
+        except Exception as _re:
+            logger.debug("重置 _default_root 失败: %s", _re)
+
+    def _show_fatal_error(title: str, body_lines: list[str], fallback_tb: str = ""):
+        """
+        优先用 Tk messagebox 弹错误；如果连 messagebox 都初始化不起来
+        （例如 Tcl/Tk 本身坏了），退回到 stderr + 文件写日志，保证错误不丢。
+        """
+        body = "\n".join(str(x) for x in body_lines if x)
+        # 先写日志（无论如何都不丢）
+        try:
+            logger.error("启动失败 %s | %s", title, body)
+            if fallback_tb:
+                logger.error("完整堆栈:\n%s", fallback_tb)
+        except Exception:
+            pass
+        # 尝试 showerror。父窗口传 None，避免依赖不存在的 MainView；
+        # Tkinter 会自动用当前最顶层的 Tk 做父（也就是 splash.root 已经关掉后新建的隐式 Tk）
+        try:
+            import tkinter.messagebox as _mb
+            # （关键改动）先 destroy 掉任何残留的不可见 Tk：可能是半初始化的 MainView
+            # 或者 splash，确保这次 messagebox 不会作为它们的「子对话框」被一起隐藏。
+            tmp_root = None
+            try:
+                try:
+                    alive_root = tk._default_root  # type: ignore[attr-defined]
+                    if alive_root is None or not bool(getattr(alive_root, 'tk', None)):
+                        raise RuntimeError("no alive tk")
+                except Exception:
+                    pass
+                # 新建一个纯隐式根，它的唯一用途就是弹出错误对话框；用完就 destroy
+                tmp_root = tk.Tk()
+                tmp_root.withdraw()
+                # 销毁除 tmp_root 之外的其他 Tk（如果有半初始化的 MainView / splash 残根）
+                _destroy_any_tk_root(tmp_root)
+                # 截断过长的堆栈：_mb 对话框不希望一次塞几万字
+                safe_body = body
+                if len(safe_body) > 4000:
+                    safe_body = safe_body[:4000] + "\n…（堆栈过长，完整内容见日志文件）"
+                _mb.showerror(title, safe_body, parent=tmp_root)
+            finally:
+                if tmp_root is not None:
+                    try:
+                        tmp_root.destroy()
+                    except Exception:
+                        pass
+                # 最终再重置一次默认根，避免后续任何隐式 Tk 行为（比如导入模块时）依赖坏根
+                try:
+                    tk._default_root = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception as _mb_err:
+            # 最后兜底：打印到控制台 + 写日志（如果还没写进去）
+            try:
+                print("=" * 60, file=sys.stderr)
+                print(f"[{title}]", file=sys.stderr)
+                print(body, file=sys.stderr)
+                if fallback_tb:
+                    print("---- traceback ----", file=sys.stderr)
+                    print(fallback_tb, file=sys.stderr)
+                print(f"(messagebox 不可用: {_mb_err})", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+            except Exception:
+                pass
+
     def load_main():
-        from view import MainView
-        splash.close()
-        app = MainView()
-        app.mainloop()
+        import traceback as _tb
+        captured_tb: str = ""
+        app = None
+        try:
+            from view import MainView
+            # 关 splash 再实例化主窗口（主窗口实例化失败时下面的 except 会再次安全关一次）
+            _close_splash_safely()
+            try:
+                app = MainView()
+            except Exception:
+                # MainView.__init__ 内部已经 destroy 自己的 Tk 根，这里再兜底一次，
+                # 防止 MainView 在 super().__init__() 之后但在自己的 destroy 之前，
+                # 因某些资源抛错而留残根。
+                try:
+                    if app is not None and bool(getattr(app, 'tk', None)):
+                        app.destroy()
+                except Exception:
+                    pass
+                raise
+            # mainloop 内部抛异常（例如 Tcl 错误）也走同一错误通道
+            try:
+                app.mainloop()
+            except Exception:
+                # mainloop 抛异常时也把 app .destroy 掉，防止主窗口半关不关的残根
+                try:
+                    if app is not None and bool(getattr(app, 'tk', None)):
+                        app.destroy()
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            captured_tb = _tb.format_exc()
+            _close_splash_safely()
+            lines = [
+                f"初始化主窗口时出错：{e}",
+                "",
+                "---- 技术堆栈（复制给开发者）----",
+                captured_tb,
+            ]
+            _show_fatal_error("启动失败", lines, fallback_tb=captured_tb)
+            # 非 0 退出码，方便 .bat / 打包脚本知道失败
+            try:
+                sys.exit(1)
+            except Exception:
+                pass
 
     splash.root.after(500, load_main)
-    splash.root.mainloop()
+    try:
+        splash.root.mainloop()
+    except Exception as _ml_err:
+        # splash 自己的 mainloop 也可能因 Tcl/Tk 底层问题报错，别静默吞掉
+        import traceback as _tb2
+        captured2 = _tb2.format_exc()
+        _close_splash_safely()
+        _show_fatal_error(
+            "启动画面运行失败",
+            [f"错误详情：{_ml_err}", "", "堆栈：", captured2],
+            fallback_tb=captured2,
+        )
 
 
 if __name__ == "__main__":

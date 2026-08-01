@@ -30,6 +30,70 @@ RESOLUTIONS = {
 }
 
 
+# ===== 安全：路径遍历封装（审计 1.1）=====
+def _secure_output_path(
+    requested_path,
+    *,
+    is_dir: bool = False,
+    default_name=None,
+    base_dir=None,
+    allow_outside: bool = False,
+    create_parent: bool = True,
+) -> Path:
+    from model import resolve_secure_output_path_external
+    if base_dir is None:
+        try:
+            cwd = Path.cwd()
+            if cwd.is_dir():
+                base_dir = cwd
+            else:
+                raise RuntimeError
+        except Exception:
+            base_dir = Path(tempfile.gettempdir())
+    return resolve_secure_output_path_external(
+        requested_path,
+        base_dir=base_dir,
+        is_dir=is_dir,
+        default_name=default_name,
+        allow_outside=allow_outside,
+        create_parent=create_parent,
+    )
+
+
+def _default_base_dir_from_input(
+    *inputs,
+    fallback=None,
+) -> Path:
+    for inp in inputs:
+        if inp is None:
+            continue
+        try:
+            p = Path(inp)
+            if p.is_dir():
+                return p.resolve()
+            if p.parent.is_dir():
+                return p.parent.resolve()
+        except Exception:
+            continue
+    if fallback is not None:
+        try:
+            pf = Path(fallback)
+            if pf.is_dir():
+                return pf.resolve()
+            if pf.parent.is_dir():
+                return pf.parent.resolve()
+        except Exception:
+            pass
+    try:
+        cwd = Path.cwd()
+        if cwd.is_dir():
+            return cwd.resolve()
+    except Exception:
+        pass
+    return Path(tempfile.gettempdir()).resolve()
+
+
+
 _FONT_CACHE: dict[int, Any] = {}
 
 
@@ -447,11 +511,16 @@ def generate_xyz_trajectory(
         total = len(timeline)
 
         energies = _read_energy_csv(energy_csv) if energy_csv else None
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        ext = "." + trajectory_format
-        if not out.suffix or out.suffix.lower() != ext:
-            out = out.with_suffix(ext)
+        # =====【审计 1.1 路径遍历修复】=====
+        _base_dir: Path = _default_base_dir_from_input(reactant_xyz, product_xyz, fallback=energy_csv)
+        try:
+            ext = "." + trajectory_format
+            out = Path(output_path)
+            if not out.suffix or out.suffix.lower() != ext:
+                out = out.with_suffix(ext)
+            out = _secure_output_path(out, base_dir=_base_dir, create_parent=True)
+        except ValueError as _v:
+            result["error"] = f"输出路径非法: {_v}"; return result
 
         if trajectory_format == "xyz":
             with open(out, "w", encoding="utf-8", newline="\n") as f:
@@ -578,6 +647,16 @@ def _concat_xyz_files(paths: list[str | os.PathLike[str]],
 def _auto_reorder_atoms(atoms_R: list[str], coords_R: list[list[float]],
                         atoms_P: list[str], coords_P: list[list[float]]
                         ) -> tuple[list[str], list[list[float]]]:
+    """
+    问题8（算法注释）：产物原子顺序自动对齐。
+    算法：同元素「最近邻贪心」匹配：
+      1. 按元素分组，只在同种元素内做匹配（保证化学式守恒后排序也守恒）。
+      2. 生成 O(N²) 对 (R_i, P_j) 两两距离平方并升序排序。
+      3. 从小到大贪心选择：若 R_i、P_j 都未被占用，则 perm[R_i] = P_j。
+      4. 把 P 按 perm 重新排列返回，使 R/P 每帧之间对应原子编号一致，
+         方便生成插值动画（否则两个分子对应原子会错位飞散）。
+    复杂度：O(N² log N)，对小分子（N < 200）完全够用。
+    """
     from collections import Counter, defaultdict
     if len(atoms_R) != len(atoms_P) or Counter(atoms_R) != Counter(atoms_P):
         raise ValueError(
@@ -707,32 +786,52 @@ def _resolve_ffmpeg_exe(name_or_path: str) -> str:
     安全解析 ffmpeg 可执行文件的绝对路径。
     防止 CWE-426 / B607：相对名 + PATH 搜索 + Windows CreateProcess 先搜当前目录，
     导致工作目录同名 ffmpeg.exe 被错误执行。
+
+    H-1 修复：允许符号链接（Linux /usr/bin/ffmpeg 几乎都是 symlink 到 /usr/bin/ffmpeg-版本），
+    改为校验真实路径（resolve 后）不在 tempdir / cwd / 用户主目录 三个用户可写目录下。
     """
     import shutil as _shutil
+    import tempfile as _tempfile
+
+    def _safe_real(p: Path) -> Path:
+        try:
+            real = p.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"ffmpeg 路径不存在或不可读: {p}") from exc
+        if not real.is_file():
+            raise RuntimeError(f"ffmpeg 路径不是文件: {real}")
+        unsafe_roots: list[Path] = []
+        for _cand in (
+            _tempfile.gettempdir(),
+            os.getcwd(),
+            os.path.expanduser("~"),
+        ):
+            try:
+                unsafe_roots.append(Path(_cand).resolve(strict=False))
+            except Exception:
+                pass
+        for root in unsafe_roots:
+            try:
+                real.relative_to(root)
+                raise RuntimeError(
+                    f"出于安全考虑，拒绝执行在可写目录下的 ffmpeg 真实路径: {real}（父目录={root}），"
+                    "请使用系统路径（如 /usr/bin/ffmpeg）下的安装。"
+                )
+            except ValueError:
+                pass
+        return real
+
     candidate = str(name_or_path).strip() or "ffmpeg"
     if os.sep in candidate or (os.altsep and os.altsep in candidate) or Path(candidate).is_absolute():
         abs_path = Path(candidate).expanduser()
-        try:
-            abs_path = abs_path.resolve(strict=True)
-        except OSError as exc:
-            raise RuntimeError(f"ffmpeg 路径不存在或不可读: {candidate}") from exc
-        if abs_path.is_symlink() or not abs_path.is_file():
-            raise RuntimeError(f"ffmpeg 路径必须是真实可执行文件而非链接: {abs_path}")
-        return str(abs_path)
+        return str(_safe_real(abs_path))
     resolved = _shutil.which(candidate)
     if not resolved:
         raise RuntimeError(
             f"未在 PATH 中找到 ffmpeg（当前输入: {candidate!r}），请安装并添加到 PATH，"
             "或在对话框中指定 ffmpeg 绝对路径（已拒绝使用相对名执行，防止工作目录同名恶意可执行劫持）。"
         )
-    abs_resolved = Path(resolved)
-    try:
-        abs_resolved = abs_resolved.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"ffmpeg 解析出的路径不存在: {resolved}") from exc
-    if abs_resolved.is_symlink() or not abs_resolved.is_file():
-        raise RuntimeError(f"ffmpeg 路径必须是真实文件: {abs_resolved}")
-    return str(abs_resolved)
+    return str(_safe_real(Path(resolved)))
 
 
 def _frames_to_mp4(frames: list[Path], out_mp4: Path, fps: int, ffmpeg_path: str) -> bool:
@@ -822,8 +921,32 @@ def generate_reaction_animation(
         one_way_steps = max(2, int(steps))
         total = len(timeline)
 
-        out_dir = Path(output_path).parent if fmt != "png_dir" else Path(output_path)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # =====【审计 1.1 路径遍历修复】=====
+        _base_dir: Path = _default_base_dir_from_input(reactant_xyz, product_xyz, fallback=energy_csv)
+        try:
+            fmt = fmt.lower()
+            if fmt == "png_dir":
+                out_dir = _secure_output_path(
+                    output_path,
+                    is_dir=True,
+                    base_dir=_base_dir,
+                    create_parent=True,
+                )
+                output = out_dir
+            else:
+                suffixes = {"gif": ".gif", "mp4": ".mp4"}
+                suf = suffixes.get(fmt, ".gif")
+                out_raw = Path(output_path)
+                if not out_raw.suffix or out_raw.suffix.lower() != suf:
+                    out_raw = out_raw.with_suffix(suf)
+                output = _secure_output_path(
+                    out_raw, base_dir=_base_dir, create_parent=True
+                )
+                out_dir = output.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except ValueError as _v:
+            result["error"] = f"输出路径非法: {_v}"
+            return result
         frames_root = Path(tempfile.mkdtemp(prefix="reaction_anim_frames_"))
         xyz_dir = frames_root / "xyz"
         raw_dir = frames_root / "raw"

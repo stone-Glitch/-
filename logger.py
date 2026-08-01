@@ -23,6 +23,7 @@ import logging.handlers
 import os
 import shutil
 import sys
+import threading
 import time
 import uuid
 import weakref
@@ -31,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, List, Tuple
 
 
 # GUI 依赖：如果是非 GUI 环境（cli 脚本 / 测试），不 import tkinter，
@@ -327,17 +328,23 @@ class GuiLogHandler(logging.Handler):
             "DEBUG": True, "INFO": True, "SUCCESS": True,
             "WARNING": True, "ERROR": True, "CRITICAL": True,
         }
+        # _queue / _all_records 会被 emit（多线程）+ _flush/repaint/clear（主线程）同时读写，
+        # 所有读写必须进入同一把 _lock，避免 list 内部结构被 race 破坏。
+        self._lock = threading.Lock()
         self._queue: list[tuple[int, str, str]] = []
         self._all_records: list[tuple[int, str, str]] = []
         self._max_records = 50000
 
     def get_all_records(self) -> list[tuple[int, str, str]]:
-        return list(self._all_records)
+        with self._lock:
+            return list(self._all_records)
 
     def get_records_for_export(self) -> list[Dict[str, Any]]:
         from datetime import datetime
         out = []
-        for lvl, lvl_name, msg in self._all_records:
+        with self._lock:
+            snap = list(self._all_records)
+        for lvl, lvl_name, msg in snap:
             out.append({
                 "time": datetime.now().strftime(DATE_FORMAT),
                 "level": lvl_name,
@@ -364,17 +371,20 @@ class GuiLogHandler(logging.Handler):
         try:
             msg = self.format(record)
             rec = (record.levelno, record.levelname, msg)
-            self._all_records.append(rec)
-            if len(self._all_records) > self._max_records:
-                self._all_records[:] = self._all_records[-self._max_records // 2:]
-            if not self._active.get(record.levelname, True):
-                return
-            self._queue.append(rec)
-            if len(self._queue) > 4000:
-                self._queue[:] = self._queue[-2000:]
-            app = self._resolve_app()
-            if app is not None and hasattr(app, "after"):
-                app.after(0, self._flush)
+            schedule_flush = False
+            with self._lock:
+                self._all_records.append(rec)
+                if len(self._all_records) > self._max_records:
+                    self._all_records[:] = self._all_records[-self._max_records // 2:]
+                if self._active.get(record.levelname, True):
+                    self._queue.append(rec)
+                    if len(self._queue) > 4000:
+                        self._queue[:] = self._queue[-2000:]
+                    schedule_flush = True
+            if schedule_flush:
+                app = self._resolve_app()
+                if app is not None and hasattr(app, "after"):
+                    app.after(0, self._flush)
         except Exception:
             self.handleError(record)
 
@@ -384,16 +394,19 @@ class GuiLogHandler(logging.Handler):
         if app is None or not hasattr(app, "log_text"):
             return
         log_text = app.log_text
+        with self._lock:
+            snap = list(self._all_records)
+            active_snap = dict(self._active)
         try:
             log_text.configure(state="normal")
             log_text.delete("1.0", _TK_END)
             count = 0
             max_lines = 8000
-            total = len(self._all_records)
+            total = len(snap)
             start_idx = max(0, total - max_lines)
             for i in range(start_idx, total):
-                lvl, lvl_name, msg = self._all_records[i]
-                if not self._active.get(lvl_name, True):
+                lvl, lvl_name, msg = snap[i]
+                if not active_snap.get(lvl_name, True):
                     continue
                 tag = "info"
                 if lvl == logging.DEBUG:    tag = "debug"
@@ -418,8 +431,9 @@ class GuiLogHandler(logging.Handler):
                 pass
 
     def clear_all(self) -> None:
-        self._all_records.clear()
-        self._queue.clear()
+        with self._lock:
+            self._all_records.clear()
+            self._queue.clear()
         app = self._resolve_app()
         if app is None or not hasattr(app, "log_text"):
             return
@@ -434,13 +448,15 @@ class GuiLogHandler(logging.Handler):
                 pass
 
     def _flush(self) -> None:
-        if not self._queue:
-            return
+        # 先加锁，快照 + 清空 queue 原子完成，避免并发 emit 在我们 flush 到一半时丢数据
+        with self._lock:
+            if not self._queue:
+                return
+            buf = self._queue[:]
+            self._queue.clear()
         app = self._resolve_app()
         if app is None or not hasattr(app, "log_text"):
-            self._queue.clear(); return
-        buf = self._queue[:]
-        self._queue.clear()
+            return
         log_text = app.log_text
         try:
             log_text.configure(state="normal")
@@ -512,6 +528,13 @@ def setup_logging() -> logging.Logger:
 
     root.addFilter(_CONTEXT_FILTER)
 
+    # —— 问题二：日志空白修复 ——
+    # 在 GUI handler 挂载之前，所有日志先存进 _STARTUP_RECORDS，等 attach_gui_handler 时批量回放。
+    startup_handler = _StartupRecordCollector()
+    startup_handler.setLevel(logging.DEBUG)
+    startup_handler.setFormatter(VerboseFormatter(fmt="%(message)s"))
+    root.addHandler(startup_handler)
+
     # 去重（同一 session 不要重复添加）
     root.addHandler(_make_console_handler())
     root.addHandler(_make_file_handler())
@@ -528,6 +551,43 @@ def setup_logging() -> logging.Logger:
     return logger_obj
 
 
+# ---------------- 问题二：启动日志回放 ----------------
+# _STARTUP_RECORDS 是 logger.py 级别全局队列，存储 setup_logging → attach_gui_handler 这段时间的所有日志，
+# 解决「用户第一次打开 GUI 时日志面板一片空白」问题（因为 banner/PSI4 导入失败等都发生在 GUI 挂载前）。
+_STARTUP_RECORDS: List[Tuple[int, str, str]] = []
+_STARTUP_RECORDS_LOCK = threading.Lock()
+_STARTUP_COLLECTED_MAX = 10000  # 再长就截断避免占内存
+
+
+class _StartupRecordCollector(logging.Handler):
+    """在 setup_logging 阶段临时挂载：所有日志除了 console/file，也入队 _STARTUP_RECORDS。"""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            try:
+                msg = str(record.getMessage())
+            except Exception:
+                msg = ""
+        rec = (record.levelno, record.levelname, msg)
+        with _STARTUP_RECORDS_LOCK:
+            _STARTUP_RECORDS.append(rec)
+            if len(_STARTUP_RECORDS) > _STARTUP_COLLECTED_MAX:
+                _STARTUP_RECORDS[:] = _STARTUP_RECORDS[-_STARTUP_COLLECTED_MAX // 2:]
+
+
+def drain_startup_records() -> List[Tuple[int, str, str]]:
+    """取出启动队列并清空；只在 attach_gui_handler 回放时用一次。"""
+    with _STARTUP_RECORDS_LOCK:
+        snap = list(_STARTUP_RECORDS)
+        _STARTUP_RECORDS.clear()
+    return snap
+
+
 default_logger = setup_logging()
 
 # 全局 GUI handler：MainView.build_ui 后调用 `attach_gui_handler(app)` 才有效
@@ -535,7 +595,11 @@ _GUI_HANDLER: Optional[GuiLogHandler] = None
 
 
 def attach_gui_handler(app_ref: Callable[[], Any]) -> GuiLogHandler:
-    """给 MainView 的 log_text 挂上 live 日志输出。返回 handler 供 UI 切过滤芯片时用。"""
+    """给 MainView 的 log_text 挂上 live 日志输出。返回 handler 供 UI 切过滤芯片时用。
+
+    同时会把 setup_logging → 此刻之间 暂存的启动日志（_STARTUP_RECORDS）批量「回放」到 handler._all_records，
+    并调用一次 repaint_all，确保 UI 打开后不会是空白面板。
+    """
     global _GUI_HANDLER
     if _GUI_HANDLER is not None:
         try:
@@ -545,8 +609,30 @@ def attach_gui_handler(app_ref: Callable[[], Any]) -> GuiLogHandler:
     handler = GuiLogHandler(app_ref)
     # 格式上 GUI 只展示 message，前缀由 on_log 自己加 tag；尽量简洁
     handler.setFormatter(logging.Formatter("%(message)s"))
+
+    # —— 启动日志回放：填到 handler._all_records，再 repaint_all 一次即可渲染到 log_text ——
+    startup = drain_startup_records()
+    if startup:
+        with handler._lock:
+            handler._all_records.extend(startup)
+            if len(handler._all_records) > handler._max_records:
+                handler._all_records[:] = handler._all_records[-handler._max_records // 2:]
+            # 启动日志默认也按过滤芯片可见（active 默认全 True），所以直接入 queue 也行，
+            # 但更稳的是走 repaint_all（已经包含可见性过滤逻辑），因此 queue 不塞也行。
+
     logging.getLogger().addHandler(handler)
     _GUI_HANDLER = handler
+
+    # —— 关键：触发一次重绘，把启动日志真正画到 log_text ——
+    try:
+        app = handler._resolve_app()
+        if app is not None and hasattr(app, "after"):
+            app.after(0, handler.repaint_all)
+    except Exception:
+        try:
+            handler.repaint_all()
+        except Exception:
+            pass
     return handler
 
 

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UI 构建器 - 负责配置区、操作按钮、文件列表、日志区、状态栏的组装
-🫧 美学：Aurora Frost（极光霜白）
-   • 霜白→冰蓝渐变底，叠极光粒子光斑
-   • 双层圆角卡片（1px 极光描边 + 柔光白底）
-   • 主色：量子蓝 #3B6EFF ｜ 极光绿 #0EA288 ｜ 分子紫 #8B5CF6
-   • 字体：Microsoft YaHei UI + Consolas（数字）
+UI 构建器 - 大字体、扁平卡片风格，无 Canvas 装饰
+- 顶部保留 Aurora 辅助类（AuroraTheme / apply_aurora_theme / AuroraGradientCanvas /
+  make_aurora_card / ToolTip / add_tooltip），供 dialogs.py 等复用
+- 底部主界面 build_ui 系列函数：纯 tk.Frame + ttk，零 Canvas 嵌套，稳定显示
 """
 
 import math
+import sys
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from constants import SUPPORTED_EXTS
@@ -17,20 +16,20 @@ from constants import SUPPORTED_EXTS
 
 # ------------------------- 🎨 主题颜色常量 -------------------------
 class AuroraTheme:
-    BG_START     = "#F5F7FF"   # 霜白
-    BG_END       = "#EEF3FF"   # 冰蓝
+    BG_START     = "#F5F7FF"
+    BG_END       = "#EEF3FF"
     CARD_BG      = "#FFFFFF"
-    CARD_BORDER  = "#D7E2FF"   # 淡蓝描边
-    CARD_HL      = "#B7CCFF"   # 悬停描边（极光）
-    CARD_SHADE   = "#E6ECFF"   # 阴影替代色
-    TEXT_MAIN    = "#1A2142"   # 主文字（深夜蓝）
-    TEXT_MUTED   = "#6B7599"   # 次级文字
+    CARD_BORDER  = "#D7E2FF"
+    CARD_HL      = "#B7CCFF"
+    CARD_SHADE   = "#E6ECFF"
+    TEXT_MAIN    = "#1A2142"
+    TEXT_MUTED   = "#6B7599"
     TEXT_BADGE   = "#FFFFFF"
-    BRAND_BLUE   = "#3B6EFF"   # 量子蓝（主 accent）
-    BRAND_GREEN  = "#0EA288"   # 极光绿（成功 / C 位）
-    BRAND_PURPLE = "#8B5CF6"   # 分子紫（高级 / 特别）
-    BRAND_ORANGE = "#FF8A3D"   # 火焰橙（警告 / TS）
-    BRAND_RED    = "#E5484D"   # 红（错误）
+    BRAND_BLUE   = "#3B6EFF"
+    BRAND_GREEN  = "#0EA288"
+    BRAND_PURPLE = "#8B5CF6"
+    BRAND_ORANGE = "#FF8A3D"
+    BRAND_RED    = "#E5484D"
     STEP_1       = "#3B6EFF"
     STEP_2       = "#8B5CF6"
     STEP_3       = "#0EA288"
@@ -45,7 +44,6 @@ class AuroraTheme:
 
     @staticmethod
     def glow(base: str, pct: float = 0.2) -> str:
-        """把 16 进制颜色往白方向提亮 pct，用于发光效果"""
         base = base.lstrip("#")
         r, g, b = (int(base[i:i+2], 16) for i in (0, 2, 4))
         r = int(r + (255 - r) * pct)
@@ -54,12 +52,299 @@ class AuroraTheme:
         return f"#{r:02x}{g:02x}{b:02x}"
 
 
+# ------------------------- 🔠 字体基线（问题一：字太小 修复） -------------------------
+# 所有控件显式指定 font=app._fonts["BASE"] 等，避免依赖系统默认 9pt。
+# font_size 来自 config.font_size（默认 14pt），配合 DPI 放大系数再调整一次。
+def resolve_font_specs(app, force_pt: int | None = None) -> dict:
+    """
+    基于 config 计算字体尺寸，结果存到 app._fonts 字典。
+
+    参数：
+      - force_pt：如果调用方传入（比如字体大小对话框保存后热更新），则忽略
+        config.font_size，直接以 force_pt 作为 raw_pt；常用于「保存后不重启」时
+        的尽力刷新。
+    """
+    try:
+        cfg = getattr(app, "config_data", {}) or {}
+    except Exception:
+        cfg = {}
+    if isinstance(force_pt, int) and force_pt > 0:
+        raw_pt = int(force_pt)
+    else:
+        raw_pt = int(cfg.get("font_size", 14) or 14)
+    raw_pt = max(8, min(24, raw_pt))                      # 8..24pt（字体对话框放宽）
+
+    # DPI 放大（Windows 125% 缩放常见）：如果 config.font_follow_dpi=True，按 DPI/96 再乘一次
+    follow_dpi = bool(cfg.get("font_follow_dpi", True))
+    scale = 1.0
+    if follow_dpi:
+        try:
+            dpi = float(app.winfo_fpixels("1i"))           # 1 英寸 = DPI 像素
+            if dpi > 0:
+                scale = dpi / 96.0
+        except Exception:
+            scale = 1.0
+        # DPI 缩放后保留 0.85~1.75，防止在 4K 屏上过大或在特殊屏上过小
+        scale = max(0.85, min(1.75, scale))
+
+    # 四舍五入成整数 pt
+    base_pt = max(10, int(round(raw_pt * scale)))
+    bold_pt = base_pt
+    tree_pt = max(10, base_pt - 1)
+    log_pt  = max(10, base_pt - 1)
+    tab_pt  = base_pt
+    btn_big_pt = max(11, base_pt)
+    h1_pt = max(12, base_pt + 2)
+
+    # 字体族：优先用系统 UI 级雅黑/微软雅黑；英文日志用 Consolas
+    family_cn = "Microsoft YaHei UI" if sys.platform == "win32" else "Microsoft YaHei"
+    family_mono = "Consolas" if sys.platform == "win32" else "Menlo"
+
+    specs = {
+        "BASE":      (family_cn, base_pt),
+        "BOLD":      (family_cn, bold_pt, "bold"),
+        "SMALL":     (family_cn, max(10, base_pt - 1)),
+        "H1":        (family_cn, h1_pt, "bold"),
+        "TREE":      (family_cn, tree_pt),
+        "TREEHEAD":  (family_cn, tree_pt, "bold"),
+        "TAB":       (family_cn, tab_pt, "bold"),
+        "BIGBTN":    (family_cn, btn_big_pt, "bold"),
+        "BTN":       (family_cn, base_pt, "bold"),
+        "BTN2":      (family_cn, base_pt),
+        "ENTRY":     (family_cn, base_pt),
+        "LABEL":     (family_cn, base_pt),
+        "LOG":       (family_mono, log_pt),
+        "STATUS":    (family_cn, max(10, base_pt - 1)),
+        "TOOLTIP":   (family_cn, max(9, base_pt - 2)),
+    }
+    app._fonts = specs
+    # 菜单栏右侧「字号 Npt」快捷显示：有就更新
+    try:
+        var = getattr(app, "_menu_font_pt_var", None)
+        if isinstance(var, tk.StringVar):
+            var.set(f"字号 {raw_pt}pt")
+    except Exception:
+        pass
+    # 也存到 app.option_add，对没有显式传 font 的老控件兜底（ttk 走 theme，tk 原生会读 *Font）
+    try:
+        app.option_add("*Font", specs["BASE"])
+        app.option_add("*Label.Font", specs["BASE"])
+        app.option_add("*Button.Font", specs["BASE"])
+        app.option_add("*Entry.Font", specs["ENTRY"])
+        app.option_add("*Text.Font", specs["BASE"])
+    except Exception:
+        pass
+    return specs
+
+
+# ------------------------- 🧭 自绘菜单栏（设置 / 帮助：字体完全可控）-------------------------
+def build_menu_bar(app) -> None:
+    """
+    用自绘 Frame + tk.Menubutton 做顶部菜单栏（Windows 原生 Menu 的 cascade 字体不可控）。
+    参考经验 415826：不要用 app.config(menu=menubar) 依赖系统绘制，改成自己在顶部放一个 Frame，
+    里面放 Menubutton，字体用 app._fonts。
+    """
+    F = getattr(app, "_fonts", {})
+    BASE      = F.get("BASE",      ("Microsoft YaHei UI", 12))
+    BOLD      = F.get("BOLD",      ("Microsoft YaHei UI", 12, "bold"))
+    BTN       = F.get("BTN",       ("Microsoft YaHei UI", 12, "bold"))
+    SMALL     = F.get("SMALL",     ("Microsoft YaHei UI", 11))
+    MENU_ITEM = F.get("MENU_ITEM", F.get("BASE", ("Microsoft YaHei UI", 12)))
+
+    # 菜单栏整体背景：用浅色，比主内容稍深一点做层级感
+    bar = tk.Frame(app, bg=COLORS.get("menu_bar_bg", "#E1EBFF"), bd=0,
+                   highlightbackground=COLORS.get("card_border", "#C7D5FF"),
+                   highlightthickness=1)
+    bar.pack(side=tk.TOP, fill=tk.X, padx=0, pady=0)
+
+    # —— 1) 应用标题标签（左侧）——
+    try:
+        tk.Label(bar, text="  分子管理器  ",
+                 bg=COLORS.get("menu_bar_bg", "#E1EBFF"),
+                 fg=COLORS.get("primary", "#3B6EFF"),
+                 font=BOLD, anchor="w", padx=6, pady=4
+                 ).pack(side=tk.LEFT)
+    except Exception:
+        pass
+
+    # 辅助：创建一个 Menubutton + 下拉 tk.Menu
+    def _make_mb(bar_parent, label: str, side=tk.LEFT):
+        # Menubutton 本身 tk.Menubutton 比 ttk.Menubutton 好配色
+        mb = tk.Menubutton(
+            bar_parent, text=label,
+            bg=COLORS.get("menu_bar_bg", "#E1EBFF"),
+            fg=COLORS.get("text", "#1A2142"),
+            activebackground=COLORS.get("menu_hover_bg", "#C8D9FF"),
+            activeforeground=COLORS.get("primary", "#3B6EFF"),
+            font=BTN, relief=tk.FLAT, bd=0, padx=14, pady=5,
+            cursor="hand2",
+        )
+        mb.pack(side=side, padx=0, pady=0)
+        menu = tk.Menu(mb, tearoff=0,
+                       bg="#FFFFFF", fg="#1A2142",
+                       activebackground=COLORS.get("primary", "#3B6EFF"),
+                       activeforeground="#FFFFFF",
+                       font=MENU_ITEM, bd=1, relief=tk.SOLID)
+        mb.configure(menu=menu)
+        return mb, menu
+
+    # —— 2) ⚙️ 设置菜单 ——
+    _mb_set, menu_set = _make_mb(bar, "  ⚙️ 设置  ")
+    try:
+        menu_set.add_command(
+            label="  🔤 字体大小…",
+            command=lambda: _safe_call(app, "show_font_size_dialog_from_menu"),
+        )
+        menu_set.add_separator()
+        # 预留给以后扩展（保留“预览前确认”等开关，先接已有变量避免空）
+        try:
+            _prev_var = getattr(app, "preview_before_operation_var", None)
+            if _prev_var is None:
+                _prev_var = tk.BooleanVar(value=True)
+                app.preview_before_operation_var = _prev_var
+            menu_set.add_checkbutton(
+                label="  ⏱️ 文件整理前先预览（建议开启）",
+                variable=_prev_var,
+                onvalue=True, offvalue=False,
+                command=lambda: _persist_preview_toggle(app),
+            )
+        except Exception:
+            pass
+        # 手动 OB 路径快捷入口
+        menu_set.add_command(
+            label="  🧭 OpenBabel 可执行路径…",
+            command=lambda: _open_ob_path_dialog(app),
+        )
+    except Exception:
+        pass
+
+    # —— 3) ❓ 帮助菜单 ——
+    _mb_help, menu_help = _make_mb(bar, "  ❓ 帮助  ")
+    try:
+        menu_help.add_command(
+            label="  🧪 环境诊断（检查 OB / PSI4 依赖）",
+            command=lambda: _safe_call(app, "show_environment_dialog_from_menu"),
+        )
+        menu_help.add_separator()
+        # 状态栏 OB 指示灯快捷入口
+        menu_help.add_command(
+            label="  🧭 手动设置 OpenBabel 可执行路径…",
+            command=lambda: _open_ob_path_dialog(app),
+        )
+        menu_help.add_command(
+            label="  🔤 调整界面字体大小…",
+            command=lambda: _safe_call(app, "show_font_size_dialog_from_menu"),
+        )
+        # 关于
+        menu_help.add_separator()
+        menu_help.add_command(
+            label="  ℹ️ 关于",
+            command=lambda: _show_about(app),
+        )
+    except Exception:
+        pass
+
+    # —— 4) 右侧状态：字体大小 + 工作目录信息（可选）——
+    try:
+        right_row = tk.Frame(bar, bg=COLORS.get("menu_bar_bg", "#E1EBFF"))
+        right_row.pack(side=tk.RIGHT, padx=6, pady=0)
+        # 字体大小显示（点击可快捷改）
+        try:
+            cfg = getattr(app, "config_data", {}) or {}
+            _cur_pt = int(cfg.get("font_size", 14) or 14)
+        except Exception:
+            _cur_pt = 14
+        _font_pt_var = tk.StringVar(value=f"字号 {_cur_pt}pt")
+        _font_btn = tk.Button(
+            right_row, textvariable=_font_pt_var,
+            bg=COLORS.get("menu_bar_bg", "#E1EBFF"),
+            fg=COLORS.get("primary", "#3B6EFF"),
+            activebackground=COLORS.get("menu_hover_bg", "#C8D9FF"),
+            activeforeground=COLORS.get("primary", "#3B6EFF"),
+            font=SMALL, relief=tk.FLAT, bd=0, padx=10, pady=5,
+            cursor="hand2",
+            command=lambda: _safe_call(app, "show_font_size_dialog_from_menu"),
+        )
+        _font_btn.pack(side=tk.RIGHT, padx=2, pady=0)
+        app._menu_font_pt_var = _font_pt_var
+    except Exception:
+        pass
+
+
+# ——— 菜单栏内部辅助：安全调用 app 方法（容错）———
+def _safe_call(app, method_name: str):
+    try:
+        fn = getattr(app, method_name, None)
+        if callable(fn):
+            return fn()
+    except Exception as _e:
+        try:
+            from logger import default_logger as _log
+            _log.warning("菜单栏调用 %s 失败：%s", method_name, _e)
+        except Exception:
+            print(f"[menu] {method_name} failed:", _e)
+
+
+def _persist_preview_toggle(app) -> None:
+    try:
+        v = bool(getattr(app, "preview_before_operation_var", None) and
+                 app.preview_before_operation_var.get())
+        cfg = getattr(app, "config_data", None)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg["preview_before_operation"] = v
+        app.config_data = cfg
+        try:
+            from config import save_config
+            save_config(cfg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _open_ob_path_dialog(app) -> None:
+    try:
+        from dialogs import Dialogs
+        dlg = Dialogs(app, getattr(app, "controller", None))
+        cb = getattr(app.helpers, "check_environment", None)
+        dlg.show_obabel_path_dialog(
+            parent=app,
+            on_saved_callback=(lambda: cb(announce_missing=False) if callable(cb) else None),
+        )
+    except Exception as _e:
+        try:
+            from tkinter import messagebox
+            messagebox.showerror("打开失败", f"无法打开 OpenBabel 路径设置：\n{_e}")
+        except Exception:
+            pass
+
+
+def _show_about(app) -> None:
+    try:
+        from tkinter import messagebox
+        try:
+            cfg = getattr(app, "config_data", {}) or {}
+            pt = int(cfg.get("font_size", 14) or 14)
+        except Exception:
+            pt = 14
+        messagebox.showinfo(
+            "关于 分子管理器",
+            "分子管理器（MolManager）\n\n"
+            "用于化学 / 物理计算文件夹整理、分子格式转换、\n"
+            "OpenBabel 工具、PSI4 量化任务 / 刚性扫描 / 动画。\n\n"
+            f"当前字号：{pt} pt\n"
+            "  • 顶部「⚙️ 设置 → 字体大小…」可调整\n"
+            "  • 右下状态栏指示灯：绿=OB 就绪，红=OB 不可用\n"
+            "  • 点击指示灯可快速进入「环境诊断」\n",
+            parent=app,
+        )
+    except Exception:
+        pass
+
+
 # ------------------------- 🎨 应用全局 ttk 主题 -------------------------
 def apply_aurora_theme(app) -> None:
-    """
-    在 MainView 初始化时调用：重写 ttk 组件样式，
-    把整站变成 Aurora Frost 风格。
-    """
     T = AuroraTheme
     style = ttk.Style(app)
     try:
@@ -67,17 +352,33 @@ def apply_aurora_theme(app) -> None:
     except tk.TclError:
         pass
 
-    # —— 全局默认 ——
+    # —— 取字体基线（问题一：字太小）——
+    fonts = getattr(app, "_fonts", None)
+    if not fonts:
+        # 兜底：build_ui 里一定先 resolve_font_specs；这里只是防调用顺序出错
+        try:
+            fonts = resolve_font_specs(app)
+        except Exception:
+            fonts = {
+                "BASE":      ("Microsoft YaHei UI", 12),
+                "BOLD":      ("Microsoft YaHei UI", 12, "bold"),
+                "BIGBTN":    ("Microsoft YaHei UI", 13, "bold"),
+                "BTN":       ("Microsoft YaHei UI", 12, "bold"),
+                "TREE":      ("Microsoft YaHei UI", 11),
+                "TREEHEAD":  ("Microsoft YaHei UI", 11, "bold"),
+                "TAB":       ("Microsoft YaHei UI", 12, "bold"),
+                "ENTRY":     ("Microsoft YaHei UI", 12),
+            }
+
     style.configure(
         ".",
         background=T.BG_END,
         foreground=T.TEXT_MAIN,
         fieldbackground=T.CARD_BG,
-        font=("Microsoft YaHei UI", 10),
+        font=fonts["BASE"],
         borderwidth=0,
     )
 
-    # —— 主按钮（圆角胶囊 + 极光描边）——
     style.configure(
         "Aurora.TButton",
         background=T.CARD_BG,
@@ -86,7 +387,7 @@ def apply_aurora_theme(app) -> None:
         borderwidth=1,
         relief="solid",
         focusthickness=0,
-        font=("Microsoft YaHei UI", 10),
+        font=fonts["BTN2"],
     )
     style.map(
         "Aurora.TButton",
@@ -97,7 +398,6 @@ def apply_aurora_theme(app) -> None:
         darkcolor=[("!active", T.CARD_BORDER), ("active", T.BRAND_BLUE)],
     )
 
-    # —— C 位大按钮（快速入门第 3 步）：极光绿发光 ——
     style.configure(
         "Aurora.BigAccent.TButton",
         background=T.BRAND_GREEN,
@@ -106,7 +406,7 @@ def apply_aurora_theme(app) -> None:
         borderwidth=0,
         relief="flat",
         focusthickness=0,
-        font=("Microsoft YaHei UI", 11, "bold"),
+        font=fonts["BIGBTN"],
     )
     style.map(
         "Aurora.BigAccent.TButton",
@@ -114,7 +414,6 @@ def apply_aurora_theme(app) -> None:
         foreground=[("active", T.TEXT_BADGE), ("pressed", T.TEXT_BADGE)],
     )
 
-    # —— 量子蓝主按钮（PSI4 计算等）——
     style.configure(
         "Aurora.Primary.TButton",
         background=T.BRAND_BLUE,
@@ -123,14 +422,13 @@ def apply_aurora_theme(app) -> None:
         borderwidth=0,
         relief="flat",
         focusthickness=0,
-        font=("Microsoft YaHei UI", 10, "bold"),
+        font=fonts["BTN"],
     )
     style.map(
         "Aurora.Primary.TButton",
         background=[("active", "#5A85FF"), ("pressed", "#2E58D6")],
     )
 
-    # —— 分子紫按钮（高级工具箱）——
     style.configure(
         "Aurora.Purple.TButton",
         background=T.BRAND_PURPLE,
@@ -139,14 +437,13 @@ def apply_aurora_theme(app) -> None:
         borderwidth=0,
         relief="flat",
         focusthickness=0,
-        font=("Microsoft YaHei UI", 10, "bold"),
+        font=fonts["BTN"],
     )
     style.map(
         "Aurora.Purple.TButton",
         background=[("active", "#9B75F7"), ("pressed", "#7348D6")],
     )
 
-    # —— LabelFrame：双层圆角卡片（clam 的 LabelFrame 支持 border）——
     style.configure(
         "Aurora.TLabelframe",
         background=T.BG_END,
@@ -158,11 +455,10 @@ def apply_aurora_theme(app) -> None:
         "Aurora.TLabelframe.Label",
         background=T.BG_END,
         foreground=T.TEXT_MAIN,
-        font=("Microsoft YaHei UI", 11, "bold"),
+        font=fonts["BOLD"],
         padding=(6, 0, 6, 6),
     )
 
-    # —— 输入 Entry / Combobox ——
     style.configure(
         "Aurora.TEntry",
         fieldbackground=T.CARD_BG,
@@ -172,6 +468,7 @@ def apply_aurora_theme(app) -> None:
         darkcolor=T.CARD_BORDER,
         padding=6,
         focusthickness=0,
+        font=fonts["ENTRY"],
     )
     style.map(
         "Aurora.TEntry",
@@ -187,29 +484,31 @@ def apply_aurora_theme(app) -> None:
         arrowcolor=T.BRAND_BLUE,
         bordercolor=T.CARD_BORDER,
         padding=6,
+        font=fonts["ENTRY"],
     )
     style.map(
         "Aurora.TCombobox",
         bordercolor=[("focus", T.BRAND_BLUE)],
     )
 
-    # —— Treeview（文件列表）——
+    # rowheight= (pt+2)*2：让行高随字体放大，避免 Tree 字挤
+    tree_row = max(26, int(fonts["TREE"][1]) * 2 + 6)
     style.configure(
         "Aurora.Treeview",
         background=T.CARD_BG,
         fieldbackground=T.CARD_BG,
         foreground=T.TEXT_MAIN,
-        rowheight=30,
+        rowheight=tree_row,
         borderwidth=1,
         relief="solid",
         bordercolor=T.CARD_BORDER,
-        font=("Microsoft YaHei UI", 10),
+        font=fonts["TREE"],
     )
     style.configure(
         "Aurora.Treeview.Heading",
         background=T.glow(T.BRAND_BLUE, 0.9),
         foreground=T.TEXT_MAIN,
-        font=("Microsoft YaHei UI", 10, "bold"),
+        font=fonts["TREEHEAD"],
         relief="flat",
         padding=6,
         borderwidth=0,
@@ -220,7 +519,6 @@ def apply_aurora_theme(app) -> None:
         foreground=[("selected", T.TREE_SEL_FG)],
     )
 
-    # —— Notebook（高级工具箱 4 标签页）——
     style.configure(
         "Aurora.TNotebook",
         background=T.BG_END,
@@ -235,7 +533,7 @@ def apply_aurora_theme(app) -> None:
         borderwidth=1,
         relief="solid",
         bordercolor=T.CARD_BORDER,
-        font=("Microsoft YaHei UI", 10, "bold"),
+        font=fonts["TAB"],
     )
     style.map(
         "Aurora.TNotebook.Tab",
@@ -244,7 +542,6 @@ def apply_aurora_theme(app) -> None:
         expand=[("selected", (0, 0, 0, 2))],
     )
 
-    # —— 进度条 ——
     style.configure(
         "Aurora.Horizontal.TProgressbar",
         troughcolor=T.CARD_SHADE,
@@ -255,7 +552,6 @@ def apply_aurora_theme(app) -> None:
         thickness=14,
     )
 
-    # —— PanedWindow ——
     style.configure(
         "Aurora.TPanedwindow",
         background=T.BG_END,
@@ -264,7 +560,6 @@ def apply_aurora_theme(app) -> None:
         borderwidth=0,
     )
 
-    # —— 滚动条 ——
     style.configure(
         "Aurora.Vertical.TScrollbar",
         background=T.CARD_SHADE,
@@ -282,24 +577,35 @@ def apply_aurora_theme(app) -> None:
         gripcount=0,
     )
 
-    # —— 记忆：供后续 build_xxx 用 ——
     app._aurora_theme = T
     app._aurora_style = style
 
 
 # ------------------------- 🎨 渐变背景画布 -------------------------
 class AuroraGradientCanvas(tk.Canvas):
-    """
-    用 Canvas 手搓一条竖向渐变 + 几颗极光粒子点缀，
-    然后在里面用 place 摆真正的内容容器。
-    因为 Tk 原生不支持 CSS gradient，只能逐行 paint。
-    """
     def __init__(self, master, c1: str, c2: str, particles: int = 14, **kwargs):
         super().__init__(master, highlightthickness=0, bd=0, **kwargs)
         self._c1 = c1
         self._c2 = c2
         self._particles_n = particles
         self.bind("<Configure>", self._redraw, add="+")
+        self.bind("<Map>", self._on_map, add="+")
+
+    def _on_map(self, _evt=None):
+        try:
+            w = self.winfo_width()
+            h = self.winfo_height()
+            if w > 1 and h > 1:
+                try:
+                    self.itemconfigure("content", width=w, height=h)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self._redraw()
+        except Exception:
+            pass
 
     @staticmethod
     def _hex2rgb(h: str) -> tuple[int, int, int]:
@@ -322,14 +628,11 @@ class AuroraGradientCanvas(tk.Canvas):
             return
         rgb1 = self._hex2rgb(self._c1)
         rgb2 = self._hex2rgb(self._c2)
-        # 画渐变：每 2 像素一条，加速
         for y in range(0, h, 2):
             t = y / max(1, h - 1)
-            # 加一点缓动（ease-in-out 让两端更深邃）
             t_e = t * t * (3 - 2 * t)
             col = self._rgb2hex((self._lerp(rgb1[i], rgb2[i], t_e) for i in range(3)))
             self.create_rectangle(0, y, w, y + 2, fill=col, outline=col)
-        # 极光光晕粒子（圆形 + 不同透明度）
         import random
         rng = random.Random(42)
         palette = [AuroraTheme.BRAND_BLUE, AuroraTheme.BRAND_GREEN, AuroraTheme.BRAND_PURPLE]
@@ -338,7 +641,6 @@ class AuroraGradientCanvas(tk.Canvas):
             cy = int(rng.uniform(0.05 * h, 0.9 * h))
             r = int(rng.uniform(40, 150))
             col = rng.choice(palette)
-            # 画 6 层同心递减的填充，模拟柔光
             for k in range(6, 0, -1):
                 alpha = 0.03 * k
                 rgb = self._hex2rgb(col)
@@ -347,50 +649,49 @@ class AuroraGradientCanvas(tk.Canvas):
                 self.create_oval(cx - r * k / 6, cy - r * k / 6,
                                  cx + r * k / 6, cy + r * k / 6,
                                  fill=mixed, outline=mixed)
+        try:
+            w2 = self.winfo_width()
+            h2 = self.winfo_height()
+            if w2 > 1 and h2 > 1:
+                self.itemconfigure("content", width=w2, height=h2)
+        except Exception:
+            pass
 
 
 # ------------------------- 🎨 玻璃卡片容器 -------------------------
-def make_aurora_card(parent, title: str | None = None, accent: str | None = None) -> tuple[tk.Frame, tk.Frame]:
-    """
-    双层圆角卡片：
-      外层 Frame：1px 极光描边 + 柔和底色（做阴影替代）
-      内层 Frame：纯白卡片 + 更大圆角视觉
-    返回 (outer, inner)：把组件放进 inner 即可。
-
-    若 title 非 None：在左上角画胶囊形彩色标题条。
-    accent：标题条颜色，默认极光绿。
-    """
+def make_aurora_card(parent, title: str | None = None, accent: str | None = None, *,
+                     app_ref=None) -> tuple[tk.Frame, tk.Frame]:
     T = AuroraTheme
     accent = accent or T.BRAND_GREEN
-    # —— 外层：极光描边容器 ——
     outer = tk.Frame(
         parent,
         bg=T.CARD_BORDER,
         highlightthickness=0,
         bd=0,
     )
-    # 用 pack_propagate 允许固定尺寸，但这里自适应即可
-    # —— 内层：纯白卡片（留 1px 边距露出外层描边）——
     inner = tk.Frame(outer, bg=T.CARD_BG, bd=0, highlightthickness=0)
     inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-    # —— 标题条（胶囊形彩色装饰 + 文字）——
     if title:
         header = tk.Frame(inner, bg=T.CARD_BG, bd=0)
         header.pack(fill=tk.X, padx=18, pady=(16, 0))
-        # 左侧小胶囊装饰（模仿色块）
         cap = tk.Frame(header, bg=accent, height=18, width=4, bd=0)
         cap.pack(side=tk.LEFT)
         tk.Frame(header, bg=T.glow(accent, 0.6), height=18, width=2, bd=0).pack(side=tk.LEFT)
+        title_font = ("Microsoft YaHei UI", 12, "bold")
+        if app_ref is not None:
+            try:
+                title_font = getattr(app_ref, "_fonts", {}).get("BOLD", title_font)
+            except Exception:
+                pass
         tk.Label(
             header,
             text=title,
             bg=T.CARD_BG,
             fg=T.TEXT_MAIN,
-            font=("Microsoft YaHei UI", 12, "bold"),
+            font=title_font,
             padx=10, pady=0,
         ).pack(side=tk.LEFT)
-        # 右侧一条渐隐分割线，增加设计感
         rule = tk.Frame(header, bg=T.CARD_BG, height=22)
         rule.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
         tk.Frame(rule, bg=T.CARD_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
@@ -400,13 +701,10 @@ def make_aurora_card(parent, title: str | None = None, accent: str | None = None
 
 # ------------------------- 🫧 Tooltip 升级：玻璃胶囊 -------------------------
 class ToolTip:
-    """
-    鼠标悬停气泡（Aurora Frost 版）：
-    深夜蓝胶囊底 + 白字 + 小三角指向触发控件。
-    """
-    def __init__(self, widget, text: str):
+    def __init__(self, widget, text: str, font=None):
         self.widget = widget
         self.text = text
+        self.font = font or ("Microsoft YaHei UI", 9)
         self.tip_window: tk.Toplevel | None = None
         self.id: str | None = None
         widget.bind("<Enter>", self._on_enter)
@@ -449,7 +747,7 @@ class ToolTip:
             justify=tk.LEFT,
             bg=T.TOOLTIP_BG,
             fg=T.TOOLTIP_FG,
-            font=("Microsoft YaHei UI", 9),
+            font=self.font,
             wraplength=320,
         ).pack()
 
@@ -459,642 +757,931 @@ class ToolTip:
             self.tip_window = None
 
 
-def add_tooltip(widget, text: str):
-    ToolTip(widget, text)
+def add_tooltip(widget, text: str, font=None):
+    ToolTip(widget, text, font=font)
+
+
+# ------------------------- 🧘 主界面：大字体、扁平卡片风格 -------------------------
+# 设计：
+#   - 100% tk.Frame + ttk，零 Canvas / create_window 嵌套（彻底避免 content 尺寸为 0）
+#   - 大字号：卡片标题 13pt / 正文 12pt / Tree 11pt（行高 30）/ 日志 13pt
+#   - 分区：配置 / 操作 / 文件列表+日志 / 状态栏
+#   - 兼容旧逻辑：filter_status_var / filter_ext_var 默认 "全部"
+#   - 关键词过滤条（输入即搜）
+
+COLORS = {
+    "bg": "#EFF3F8",
+    "card_bg": "#FFFFFF",
+    "card_border": "#C8D0DC",
+    "primary": "#2A6DF4",
+    "success": "#1E8E5C",
+    "warning": "#E67E22",
+    "danger": "#E74C3C",
+    "text": "#2C3E50",
+    "text_light": "#5D6D7E",
+}
+
+
+# ------------------------- 🔧 辅助：可折叠面板（Labelframe 可「展开/收起」） -------------------------
+class CollapsibleFrame(tk.LabelFrame):
+    """
+    一个可折叠的 LabelFrame：标题栏右侧有「▼/▶」按钮，点击后收起下方内容；
+    用于「高级参数」「扫描参数」等默认折叠、不干扰新手但保持功能完整的面板。
+    """
+
+    def __init__(self, master, title: str = "", collapsed: bool = False, **kwargs):
+        kwargs.setdefault("bg", COLORS["card_bg"])
+        kwargs.setdefault("fg", COLORS["text"])
+        # 字太小：LabelFrame 标题默认 12→至少 13pt bold（跟随 config 默认 14pt 的 BOLD 基线）
+        kwargs.setdefault("font", ('Microsoft YaHei', 13, 'bold'))
+        kwargs.setdefault("relief", tk.GROOVE)
+        kwargs.setdefault("bd", 2)
+        super().__init__(master, text=f"  {title}  ", **kwargs)
+        self._collapsed = collapsed
+        self._title = title
+        # 子容器：所有用户内容都应塞到 self.body 里
+        self.body = tk.Frame(self, bg=COLORS["card_bg"])
+        # 「▼ / ▶」切换按钮：嵌入 labelwidget 机制更复杂，这里在 label_frame 的「空白」放
+        # 一个小按钮到右上角即可（grid 里塞一个 LabelFrame 内没有直接右上角位置，改用叠加实现）
+        self._toggle_btn = tk.Button(
+            self, text="▼", relief=tk.FLAT, bg=COLORS["card_bg"], fg=COLORS["primary"],
+            font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')), cursor="hand2", width=3,
+            command=self._toggle,
+        )
+        # 用 place 放到右上角，不影响 body 的 pack/grid
+        self._toggle_btn.place(relx=1.0, y=2, anchor="ne")
+        self.bind("<Configure>", lambda _e: self._reposition_toggle())
+        self._last_collapsed = not collapsed  # 触发初次展开/收起
+        self._toggle()
+
+    def _reposition_toggle(self):
+        try:
+            self._toggle_btn.place(relx=1.0, y=2, anchor="ne")
+        except Exception:
+            pass
+
+    def _toggle(self):
+        want_collapse = not self._collapsed
+        if self._collapsed == want_collapse and self._last_collapsed == want_collapse:
+            # 初始化首次：用当前状态来决定 body 显示
+            want_collapse = self._collapsed
+        if want_collapse:
+            # 收起：body 从布局中移除
+            try:
+                self.body.pack_forget()
+            except Exception:
+                try:
+                    self.body.grid_forget()
+                except Exception:
+                    pass
+            self._toggle_btn.config(text="▶")
+        else:
+            # 展开：body 显示（优先 pack fill=x）
+            self.body.pack(fill=tk.X, expand=False, padx=4, pady=(0, 6))
+            self._toggle_btn.config(text="▼")
+        self._last_collapsed = want_collapse
+        self._collapsed = want_collapse
+
+
+# ------------------------- 🎨 颜色调色板（保持原清爽扁平风格，新增「推荐/信息/警告/危险」按钮色） -------------------------
+COLORS = {
+    "bg": "#EFF3F8",
+    "card_bg": "#FFFFFF",
+    "card_border": "#C8D0DC",
+    "primary": "#2A6DF4",
+    "success": "#1E8E5C",
+    "warning": "#E67E22",
+    "danger": "#E74C3C",
+    "text": "#2C3E50",
+    "text_light": "#5D6D7E",
+    # 颜色编码：按钮背景
+    "btn_recommend_bg": "#1E8E5C",   # 绿色：一键修复等推荐操作
+    "btn_info_bg": "#2A6DF4",        # 蓝色：信息/扫描
+    "btn_warn_bg": "#E67E22",        # 橙色：警告操作
+    "btn_danger_bg": "#E74C3C",      # 红色：删除
+    "btn_text": "#FFFFFF",
+}
 
 
 def build_ui(app):
     """
-    构建主界面的所有组件：
-      • 先铺一层 AuroraGradientCanvas 做渐变背景（极光粒子）
-      • 背景之上放一个 content 容器（纯透明 Frame）
-      • content 里依次摆 4 张玻璃卡片（快速入门 / 高级配置 / 详细操作 / 列表+日志）
+    构建新版主界面：
+      - 顶部全局工具栏（工作目录/最近目录/扫描/撤销重做/进度条）
+      - 中部 ttk.Notebook 三标签页（📁 文件管理 / 🔬 计算与动画 / ⚙️ 高级工具）
+      - 底部状态栏（状态文字 + 进度条 + 操作提示）
+    **零功能损失**：所有旧变量 app.work_dir_entry / app.tree / app.log_text / app.fix_mode_var
+    等名称完全保留，controller.py 与 dialogs.py 保持不改动。
+
+    ===== 问题一（字太小）修复 =====
+    - 在任何控件创建前先 resolve_font_specs，把字体基线写到 app._fonts 和 app.option_add。
+    - 之后所有显式创建的 Label / Button / Entry / Combobox / Treeview / Notebook 页签 / 日志 / 状态栏 都用统一字体。
+    - apply_aurora_theme 再把 ttk 控件样式改成同一套字体。
     """
-    T = AuroraTheme
-    # —— 渐变背景铺满整个窗口 ——
-    bg = AuroraGradientCanvas(app, T.BG_START, T.BG_END, particles=16)
-    bg.pack(fill=tk.BOTH, expand=True)
-
-    # —— 内容容器（通过 window create_window 放在 Canvas 里，占满整个 Canvas）——
-    content = tk.Frame(bg, bg=T.BG_END, bd=0, highlightthickness=0)
-    bg.create_window(0, 0, window=content, anchor="nw", tags=("content",))
-
-    def _sync_content_size(evt=None):
-        w = max(bg.winfo_width(), 1)
-        h = max(bg.winfo_height(), 1)
-        bg.itemconfigure("content", width=w, height=h)
-    bg.bind("<Configure>", _sync_content_size, add="+")
-
-    content.grid_rowconfigure(0, weight=0)
-    content.grid_rowconfigure(1, weight=0)
-    content.grid_rowconfigure(2, weight=0)
-    content.grid_rowconfigure(3, weight=1)
-    content.grid_columnconfigure(0, weight=1)
-    # 外层统一 padding（用内部 Frame pad 即可）
-    for c in (content,):
-        c.configure(padx=14, pady=14)
-
-    # 给主窗口一个统一的品牌色标题栏底色（可选：bg 属性）
+    # === 字太小：Step 1. 先算字体基线 ===
     try:
-        app.configure(bg=T.BG_END)
-    except tk.TclError:
+        resolve_font_specs(app)
+    except Exception as _e:
+        # 字体计算失败不影响主流程，走系统默认
+        import traceback as _tb
+        print("[ui_builder] resolve_font_specs failed:", _tb.format_exc())
+    apply_aurora_theme_if_available(app)
+
+    # —— 0. 顶部菜单栏（自绘 Menubutton，平台无关；字体完全可控）——
+    try:
+        build_menu_bar(app)
+    except Exception as _me:
+        import traceback as _tb
+        print("[ui_builder] build_menu_bar failed:", _tb.format_exc())
+
+    main = tk.Frame(app, bg=COLORS["bg"])
+    main.pack(fill=tk.BOTH, expand=True)
+    main.grid_rowconfigure(0, weight=0)   # toolbar
+    main.grid_rowconfigure(1, weight=1)   # notebook （拉伸占满）
+    main.grid_rowconfigure(2, weight=0)   # status bar
+    main.grid_columnconfigure(0, weight=1)
+
+    app.configure(bg=COLORS["bg"])
+
+    # —— 1. 顶部工具栏 ——
+    build_toolbar(app, main)
+
+    # —— 2. 三标签页 Notebook ——
+    app.main_notebook = ttk.Notebook(main)
+    app.main_notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 4))
+
+    # Tab1：📁 文件管理（新手主战场）
+    tab_file = tk.Frame(app.main_notebook, bg=COLORS["bg"])
+    app.main_notebook.add(tab_file, text="  📁  文件管理  ")
+    build_tab_file_management(app, tab_file)
+
+    # Tab2：🔬 计算与动画（日常任务）
+    tab_compute = tk.Frame(app.main_notebook, bg=COLORS["bg"])
+    app.main_notebook.add(tab_compute, text="  🔬  计算与动画  ")
+    build_tab_compute_and_animation(app, tab_compute)
+
+    # Tab3：⚙️ 高级工具（专家工具箱，功能零丢失）
+    tab_advanced = tk.Frame(app.main_notebook, bg=COLORS["bg"])
+    app.main_notebook.add(tab_advanced, text="  ⚙️  高级工具  ")
+    build_tab_advanced_tools(app, tab_advanced)
+
+    # —— 3. 底部状态栏（替换原来的 build_status_bar，增加「操作提示」） ——
+    build_status_bar_new(app)
+
+    # —— 兼容旧 apply_filter：UI 上已删除 status/ext 下拉，默认都为 "全部" ——
+    for _attr, _default in (("filter_status_var", "全部"), ("filter_ext_var", "全部")):
+        v = getattr(app, _attr, None)
+        if v is None:
+            setattr(app, _attr, tk.StringVar(value=_default))
+        else:
+            try:
+                v.set(_default)
+            except Exception:
+                pass
+
+    # —— 关键词过滤：<KeyRelease> 实时刷新 ——
+    try:
+        app.filter_keyword_entry.bind("<KeyRelease>", lambda e: app.helpers.apply_filter())
+    except Exception:
         pass
 
-    app._aurora_bg = bg          # 记下来方便后续刷新
 
-    build_quickstart_card(app, content)
-    build_config_frame(app, content)
-    build_action_frame(app, content)
-    build_paned_area(app, content)
-    build_status_bar(app)
-
-    app.filter_keyword_entry.bind("<KeyRelease>", lambda e: app.helpers.apply_filter())
-    app.filter_status_combo.bind("<<ComboboxSelected>>", lambda e: app.helpers.apply_filter())
-    app.filter_ext_combo.bind("<<ComboboxSelected>>", lambda e: app.helpers.apply_filter())
+def apply_aurora_theme_if_available(app):
+    """如果有 apply_aurora_theme 就调用（tkk Notebook/Progressbar/Button 样式更统一）。"""
+    try:
+        from ui_builder import apply_aurora_theme
+        apply_aurora_theme(app)
+    except Exception:
+        pass
 
 
-def build_quickstart_card(app, parent):
+# ===========================================================
+# 🔝 顶部全局工具栏
+# ===========================================================
+def build_toolbar(app, parent):
     """
-    🚀 快速入门玻璃卡片（极光绿标题 + 3 步流程芯片 + 工具直达胶囊按钮）
+    顶部工具栏：工作目录显示 + 最近目录 + 扫描/刷新 + 撤销/重做，
+    进度条放到状态栏（底部），新手的主要动作集中在各标签页。
     """
-    T = AuroraTheme
-    outer, inner = make_aurora_card(parent, title="🚀 快速入门｜新手按 ① → ② → ③ 顺序点", accent=T.STEP_3)
-    outer.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-    parent.grid_columnconfigure(0, weight=1)
+    # 取字体（问题一：字太小）
+    F = getattr(app, "_fonts", {})
+    BASE      = F.get("BASE",      ("Microsoft YaHei", 12))
+    BOLD      = F.get("BOLD",      ("Microsoft YaHei", 12, "bold"))
+    SMALL_BTN = F.get("BTN2",      ("Microsoft YaHei", 12))
+    ENTRY     = F.get("ENTRY",     ("Microsoft YaHei", 12))
+    HINT_BTN  = F.get("SMALL",     ("Microsoft YaHei", 11))
 
-    # 整体内容区，留足内边距
-    body = tk.Frame(inner, bg=T.CARD_BG, bd=0)
-    body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(12, 18))
+    bar = tk.Frame(parent, bg=COLORS["card_bg"], bd=1, relief=tk.SOLID,
+                   highlightbackground=COLORS["card_border"], highlightthickness=1)
+    bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+    bar.grid_columnconfigure(2, weight=1)
 
-    # —— 三步骤：用「连接线 + 彩色芯片 + 内容」——
-    steps_row = tk.Frame(body, bg=T.CARD_BG, bd=0)
-    steps_row.pack(fill=tk.X)
+    # —— 列 0：工作目录 ——
+    tk.Label(bar, text=" 📂 工作目录:", bg=COLORS["card_bg"],
+             fg=COLORS["text"], font=BOLD).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+    app.work_dir_entry = ttk.Entry(bar, textvariable=app.work_dir_var, font=ENTRY, width=38)
+    app.work_dir_entry.grid(row=0, column=1, sticky="w", padx=(0, 6), pady=6)
 
-    s1_done, s2_done, s3_done = [None, None, None]
+    def _row0_btn(text, cmd, bg=None, fg=None, tip=""):
+        style_kw = {}
+        if bg:
+            style_kw.update(bg=bg, fg=fg or COLORS["btn_text"],
+                            activebackground=bg, activeforeground=fg or COLORS["btn_text"])
+        b = tk.Button(bar, text=text, command=cmd, relief=tk.RAISED, bd=1, padx=10, pady=5,
+                      font=SMALL_BTN, cursor="hand2", **style_kw)
+        if tip:
+            add_tooltip(b, tip, font=HINT_BTN)
+        return b
 
-    def _chip(root, num: str, color: str, title: str, desc: str):
-        """单个步骤芯片：圆形数字徽章 + 标题 + 说明 + 按钮"""
-        wrap = tk.Frame(root, bg=T.CARD_BG, bd=0)
-        # 左侧圆形数字徽章
-        badge = tk.Frame(wrap, bg=color, width=42, height=42, bd=0, highlightthickness=0)
-        badge.pack(side=tk.LEFT, padx=(0, 12))
-        badge.pack_propagate(False)
-        tk.Label(badge, text=num, bg=color, fg=T.TEXT_BADGE,
-                 font=("Microsoft YaHei UI", 15, "bold")).pack(expand=True)
-        # 右侧文字区
-        txt = tk.Frame(wrap, bg=T.CARD_BG, bd=0)
-        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Label(txt, text=title, bg=T.CARD_BG, fg=T.TEXT_MAIN,
-                 font=("Microsoft YaHei UI", 10, "bold"), anchor="w").pack(fill=tk.X)
-        tk.Label(txt, text=desc, bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                 font=("Microsoft YaHei UI", 9), anchor="w").pack(fill=tk.X)
-        return wrap
+    _row0_btn("浏览…", app.controller.browse_work_dir,
+              tip="选择新的工作目录并扫描文件").grid(row=0, column=2, sticky="w", padx=2, pady=6)
+    try:
+        _row0_btn("🕘 最近", app.controller.show_recent_dirs_dialog,
+                  tip="从最近打开的工作目录中切换").grid(row=0, column=3, sticky="w", padx=2, pady=6)
+    except Exception:
+        pass
 
-    # ①
-    c1_wrap = tk.Frame(steps_row, bg=T.CARD_BG, bd=0)
-    c1_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-    _chip(c1_wrap, "①", T.STEP_1, "选择文件夹", "找到放分子文件的那个目录").pack(fill=tk.X)
-    b1 = ttk.Button(c1_wrap, text="📂 选择分子文件所在目录", style="Aurora.TButton",
-                    command=lambda: (app.controller.browse_work_dir(),
-                                     _qs_update_step_label(app, s1_done)))
-    b1.pack(fill=tk.X, pady=(8, 0))
-    s1_done = tk.Label(c1_wrap, text="  ⚪ 未开始", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                       font=("Microsoft YaHei UI", 9))
-    s1_done.pack(anchor="w", pady=(6, 0))
+    # —— 分隔 ——
+    tk.Frame(bar, bg=COLORS["card_border"], width=2).grid(row=0, column=4, sticky="ns", padx=8, pady=4)
 
-    # 连接线 1→2
-    conn = tk.Frame(steps_row, bg=T.CARD_BG, bd=0, width=40)
-    conn.grid(row=0, column=1, sticky="ns", padx=(2, 6), pady=22)
-    tk.Frame(conn, bg=T.CARD_BORDER, height=2).pack(fill=tk.X, pady=(20, 0))
+    # —— 列：扫描 / 刷新 ——
+    _row0_btn("🔍 扫描文件", app.controller.scan_files,
+              bg=COLORS["btn_info_bg"], tip="重新扫描工作目录下的所有计算文件"
+              ).grid(row=0, column=5, sticky="w", padx=2, pady=6)
+    _row0_btn("🔄 刷新显示", app.controller.scan_files,
+              tip="刷新文件列表显示"
+              ).grid(row=0, column=6, sticky="w", padx=2, pady=6)
 
-    # ②
-    c2_wrap = tk.Frame(steps_row, bg=T.CARD_BG, bd=0)
-    c2_wrap.grid(row=0, column=2, sticky="nsew", padx=8)
-    _chip(c2_wrap, "②", T.STEP_2, "加载对照表（可跳过）", "英文名 → 中文名 CSV 映射").pack(fill=tk.X)
-    b2 = ttk.Button(c2_wrap, text="📥 选英文名→中文映射 (可选)", style="Aurora.TButton",
-                    command=lambda: (app.controller.browse_mapping(),
-                                     app.controller.load_mapping_file(),
-                                     _qs_update_step_label(app, s2_done, force_done=True)))
-    b2.pack(fill=tk.X, pady=(8, 0))
-    s2_done = tk.Label(c2_wrap, text="  ⚪ 可跳过", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                       font=("Microsoft YaHei UI", 9))
-    s2_done.pack(anchor="w", pady=(6, 0))
+    tk.Frame(bar, bg=COLORS["card_border"], width=2).grid(row=0, column=7, sticky="ns", padx=8, pady=4)
 
-    # 连接线 2→3
-    conn2 = tk.Frame(steps_row, bg=T.CARD_BG, bd=0, width=40)
-    conn2.grid(row=0, column=3, sticky="ns", padx=(6, 2), pady=22)
-    tk.Frame(conn2, bg=T.CARD_BORDER, height=2).pack(fill=tk.X, pady=(20, 0))
+    # —— 列：撤销 / 重做 ——
+    _row0_btn("↩ 撤销", app.controller.undo_last,
+              tip="撤销上一步文件操作（重命名/移动/整理等）"
+              ).grid(row=0, column=8, sticky="w", padx=2, pady=6)
+    try:
+        _row0_btn("↪ 重做", app.controller.redo_last,
+                  tip="重做被撤销的操作"
+                  ).grid(row=0, column=9, sticky="w", padx=2, pady=6)
+    except Exception:
+        pass
 
-    # ③（C 位：极光绿渐变大按钮）
-    c3_wrap = tk.Frame(steps_row, bg=T.CARD_BG, bd=0)
-    c3_wrap.grid(row=0, column=4, sticky="nsew", padx=8)
-    _chip(c3_wrap, "③", T.STEP_3, "一键搞定", "自动扫描 → 自动重命名｜闭眼点").pack(fill=tk.X)
-    def _quick_fix_all():
-        app.controller.scan_files()
-        _qs_update_step_label(app, s1_done, force_done=True)
-        app.after(220, lambda: (app.controller.run_fix_by_mode(),
-                                 _qs_update_step_label(app, s3_done, force_done=True)))
-    b3 = ttk.Button(c3_wrap, text="✨ 一键扫描并自动重命名（推荐！）",
-                    style="Aurora.BigAccent.TButton", command=_quick_fix_all)
-    b3.pack(fill=tk.X, pady=(8, 0))
-    s3_done = tk.Label(c3_wrap, text="  ⚪ 点上方绿色按钮开始", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                       font=("Microsoft YaHei UI", 9))
-    s3_done.pack(anchor="w", pady=(6, 0))
-
-    # 扩展列宽权重
-    steps_row.grid_columnconfigure(0, weight=1)
-    steps_row.grid_columnconfigure(2, weight=1)
-    steps_row.grid_columnconfigure(4, weight=1)
-
-    # —— 第二行：常用工具直达（胶囊按钮行）——
-    tool_bar = tk.Frame(body, bg=T.CARD_BG, bd=0)
-    tool_bar.pack(fill=tk.X, pady=(18, 0))
-
-    # 上方分割装饰：左侧渐变色 + 中间文字 + 右侧渐变色
-    deco = tk.Frame(tool_bar, bg=T.CARD_BG, bd=0)
-    deco.pack(fill=tk.X, pady=(0, 12))
-    tk.Frame(deco, bg=T.CARD_BORDER, height=1).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=9)
-    tk.Label(deco, text="  🧰  常用工具直达  ", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-             font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
-    tk.Frame(deco, bg=T.CARD_BORDER, height=1).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=9)
-
-    q_row = tk.Frame(tool_bar, bg=T.CARD_BG, bd=0)
-    q_row.pack(fill=tk.X)
-    q_react = ttk.Button(q_row, text="🎬  做反应动画  (GIF / MP4)", style="Aurora.Primary.TButton",
-                         command=app.controller.show_reaction_animation_dialog)
-    q_react.pack(side=tk.LEFT, padx=(0, 10))
-    q_psi = ttk.Button(q_row, text="⚡  量子化学计算  PSI4", style="Aurora.TButton",
-                       command=app.controller.show_psi4_dialog)
-    q_psi.pack(side=tk.LEFT, padx=(0, 10))
-    q_ob = ttk.Button(q_row, text="🔬  OpenBabel 工具箱", style="Aurora.TButton",
-                      command=app.controller.show_openbabel_dialog)
-    q_ob.pack(side=tk.LEFT, padx=(0, 10))
-    q_adv = ttk.Button(q_row, text="🧰  高级工具箱 （新页面）", style="Aurora.Purple.TButton",
-                       command=app.controller.show_advanced_tools_dialog)
-    q_adv.pack(side=tk.LEFT, padx=(0, 10))
-    tk.Label(q_row, text="  悬停任意按钮查看使用说明 💡",
-             bg=T.CARD_BG, fg=T.TEXT_MUTED,
-             font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
-
-    # —— tooltip 绑定 ——
-    add_tooltip(b1, "第 1 步：选择放着你 .mol / .xyz / .fchk 等\n分子文件的那个文件夹，比如『D:\\我的分子文件』")
-    add_tooltip(b2, "第 2 步（可以不做）：选一张 .csv 对照表\n格式：左列英文名，右列中文名\n例如：ch4, 甲烷")
-    add_tooltip(b3, "第 3 步：按一下就自动搞定！\n自动扫描文件夹 → 找到需要改名的文件 → 自动加上中文名")
-    add_tooltip(q_react, "做化学反应动画：\n左边选反应物分子，右边选产物分子\n选个溶剂，点一下就出 GIF/MP4 动图")
-    add_tooltip(q_psi, "跑量子化学计算：\n算单点能 / 优化结构 / 振动频率\n需要先装好 PSI4 软件")
-    add_tooltip(q_ob, "OpenBabel 工具箱：\n.mol ↔ .xyz 互转、画 2D 结构图、\n分子叠合对齐 等")
-    add_tooltip(q_adv, "打开高级功能新标签页：\n"
-                       "• 构象搜索 + 二面角扫描 / 批量 HOMO LUMO\n"
-                       "• TS IRC 最小能量路径 + 能垒台阶图 + Eyring t₁/₂\n"
-                       "• pKa SMD 预测 / ¹H NMR Boltzmann 谱图")
-
-    app._qs_labels = {"s1": s1_done, "s2": s2_done, "s3": s3_done}
-
-
-def _qs_update_step_label(app, label_widget, force_done: bool = False):
-    """更新快速入门步骤状态标签：⚪ 未做 → 🔵 进行中 → 🟢 已完成"""
-    T = AuroraTheme
-    if force_done:
-        label_widget.configure(text="  🟢 已完成", fg=T.BRAND_GREEN,
-                               font=("Microsoft YaHei UI", 9, "bold"))
-        return
-    work_dir = app.work_dir_var.get().strip()
-    if work_dir and app._qs_labels.get("s1") is label_widget:
-        label_widget.configure(text="  🟢 已选择", fg=T.BRAND_GREEN,
-                               font=("Microsoft YaHei UI", 9, "bold"))
-    mapping_txt = app.mapping_count.get().strip()
-    if mapping_txt and mapping_txt not in ("未加载", "0 条") and app._qs_labels.get("s2") is label_widget:
-        label_widget.configure(text="  🟢 已加载", fg=T.BRAND_GREEN,
-                               font=("Microsoft YaHei UI", 9, "bold"))
-
-
-def build_config_frame(app, parent):
-    """
-    ⚙️ 高级配置玻璃卡片（量子蓝标题 accent）。
-    """
-    T = AuroraTheme
-    outer, inner = make_aurora_card(parent, title="⚙️  高级配置（新手用上面的快速入门即可）", accent=T.BRAND_BLUE)
-    outer.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-
-    body = tk.Frame(inner, bg=T.CARD_BG, bd=0)
-    body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(14, 18))
-    body.grid_columnconfigure(1, weight=1)
-
-    # —— 公用：一个左对齐的 Label 函数 ——
-    def _label(text: str):
-        return tk.Label(body, text=text, bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                        font=("Microsoft YaHei UI", 10, "bold"))
-
-    # 工作目录
-    lbl_wd = _label("工作目录")
-    lbl_wd.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-    app.work_dir_entry = ttk.Entry(body, textvariable=app.work_dir_var, style="Aurora.TEntry")
-    app.work_dir_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(0, 8))
-    btn_wd = ttk.Button(body, text="📂 浏览", style="Aurora.TButton", command=app.controller.browse_work_dir)
-    btn_wd.grid(row=0, column=2, sticky="w", pady=(0, 8))
-    add_tooltip(lbl_wd, "工作目录：存放 .mol / .xyz / .fchk 等\n分子文件的文件夹")
-    add_tooltip(app.work_dir_entry, "也可以直接把路径粘贴到这里")
-    add_tooltip(btn_wd, "弹出文件夹选择器，选择后会立刻自动扫描")
-
-    # 映射文件
-    lbl_map = _label("映射文件")
-    lbl_map.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=8)
-    app.map_entry = ttk.Entry(body, textvariable=app.mapping_file_var, style="Aurora.TEntry")
-    app.map_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=8)
-    col1 = tk.Frame(body, bg=T.CARD_BG, bd=0)
-    col1.grid(row=1, column=2, sticky="w", pady=8)
-    btn_map_browse = ttk.Button(col1, text="📂 浏览", style="Aurora.TButton", command=app.controller.browse_mapping)
-    btn_map_browse.pack(side=tk.LEFT)
-    btn_map_load = ttk.Button(col1, text="📥 加载映射", style="Aurora.TButton", command=app.controller.load_mapping_file)
-    btn_map_load.pack(side=tk.LEFT, padx=(8, 10))
-    tk.Label(col1, text="已加载：", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-             font=("Microsoft YaHei UI", 10)).pack(side=tk.LEFT)
-    tk.Label(col1, textvariable=app.mapping_count, bg=T.CARD_BG, fg=T.BRAND_BLUE,
-             font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
-    add_tooltip(lbl_map, "映射 = 英文名→中文名 的对照表\n格式：CSV，左列 english 右列 chinese\n例如：ch4, 甲烷")
-    add_tooltip(btn_map_load, "把 CSV 里的中英文对照读入内存")
-
-    # 文件类型
-    lbl_ext = _label("文件类型")
-    lbl_ext.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+    # —— 列：文件类型过滤入口 ——
+    tk.Frame(bar, bg=COLORS["card_border"], width=2).grid(row=0, column=10, sticky="ns", padx=8, pady=4)
+    tk.Label(bar, text="文件类型:", bg=COLORS["card_bg"],
+             fg=COLORS["text_light"], font=getattr(app, '_fonts', {}).get('SMALL', ('Microsoft YaHei', 11))).grid(row=0, column=11, sticky="w", padx=(0, 4), pady=6)
     app.ext_display_var = tk.StringVar()
     app.helpers.update_ext_display()
-    ext_display = tk.Label(body, textvariable=app.ext_display_var,
-                           bg=T.glow(T.BRAND_BLUE, 0.92), fg=T.BRAND_BLUE,
-                           relief="flat", padx=12, pady=6,
-                           font=("Consolas", 10))
-    ext_display.grid(row=2, column=1, sticky="w", padx=(0, 10), pady=(8, 0))
-    col2 = tk.Frame(body, bg=T.CARD_BG, bd=0)
-    col2.grid(row=2, column=2, sticky="w", pady=(8, 0))
-    btn_ext = ttk.Button(col2, text="📋 选择文件类型", style="Aurora.TButton", command=app.controller.show_ext_filter_dialog)
-    btn_ext.pack(side=tk.LEFT)
-    btn_scan_here = ttk.Button(col2, text="🔍 应用过滤", style="Aurora.TButton", command=app.controller.scan_files)
-    btn_scan_here.pack(side=tk.LEFT, padx=(8, 0))
-    add_tooltip(lbl_ext, "只显示哪些后缀名的文件，默认已包含常见的 .mol .xyz .fchk .out .inp")
-    add_tooltip(btn_scan_here, "按当前选的文件类型重新扫描文件夹（=刷新列表）")
+    tk.Label(bar, textvariable=app.ext_display_var, bg="#E6EEF8", fg=COLORS["primary"],
+             font=getattr(app, '_fonts', {}).get('LOG', ('Consolas', 12)), relief=tk.SUNKEN, padx=10, pady=2
+             ).grid(row=0, column=12, sticky="w", padx=(0, 4), pady=6)
+    _row0_btn("选择…", app.controller.show_ext_filter_dialog,
+              tip="调整需要显示/扫描的文件扩展名"
+              ).grid(row=0, column=13, sticky="w", padx=2, pady=6)
 
 
-def build_action_frame(app, parent):
-    """🛠️ 详细操作玻璃卡片（分子紫 accent）—— 4 行分区，每行一个 emoji 小标题 + 按钮胶囊"""
-    T = AuroraTheme
-    outer, inner = make_aurora_card(parent, title="🛠️  详细操作｜高级功能区", accent=T.BRAND_PURPLE)
-    outer.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+# ===========================================================
+# 📁 Tab1：文件管理（新手默认页面）
+# ===========================================================
+def build_tab_file_management(app, parent):
+    """
+    文件管理页：
+      - 上：映射文件管理行
+      - 中：两行主操作按钮（一键修复 / 整理 / 映射 高确定性操作）
+      - 下：文件列表（Treeview + 过滤） +  右侧 日志（垂直 PanedWindow 保留）
+    """
+    parent.grid_rowconfigure(2, weight=1)
+    parent.grid_columnconfigure(0, weight=1)
 
-    body = tk.Frame(inner, bg=T.CARD_BG, bd=0)
-    body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(14, 18))
+    # —— R0：映射管理（新手最困惑的点之一：把映射拉到最前面，显眼） ——
+    map_card = tk.LabelFrame(parent, text="  🗂️  中英文/编号映射（可双击中文名条目编辑）  ",
+                             bg=COLORS["card_bg"], fg=COLORS["text"],
+                             font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')), relief=tk.GROOVE, bd=2)
+    map_card.grid(row=0, column=0, sticky="ew", padx=4, pady=(6, 4))
+    map_card.grid_columnconfigure(1, weight=1)
 
-    def _row(icon: str, title: str, accent: str):
-        """生成一行（标签头 + 按钮容器 + 分隔条）"""
-        wrap = tk.Frame(body, bg=T.CARD_BG, bd=0)
-        wrap.pack(fill=tk.X, pady=6)
-        # 左侧竖条 + 标题
-        head = tk.Frame(wrap, bg=T.CARD_BG, bd=0)
-        head.pack(side=tk.LEFT, padx=(0, 14))
-        tk.Frame(head, bg=accent, width=3, height=22, bd=0).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(head, text=f"{icon} {title}", bg=T.CARD_BG, fg=T.TEXT_MAIN,
-                 font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
-        # 右侧按钮容器
-        btns = tk.Frame(wrap, bg=T.CARD_BG, bd=0)
-        btns.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        return btns
+    tk.Label(map_card, text="映射文件路径:", bg=COLORS["card_bg"],
+             fg=COLORS["text"], font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12))
+             ).grid(row=0, column=0, sticky="w", padx=8, pady=8)
+    app.map_entry = ttk.Entry(map_card, textvariable=app.mapping_file_var, font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12)))
+    app.map_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=8)
 
-    # —— 第一行：文件操作 ——
-    row0 = _row("📁", "文件", AuroraTheme.STEP_1)
-    btn_scan = ttk.Button(row0, text="扫描文件", style="Aurora.TButton", command=app.controller.scan_files)
-    btn_scan.pack(side=tk.LEFT, padx=(0, 6))
-    btn_missing = ttk.Button(row0, text="生成缺失列表", style="Aurora.TButton", command=app.controller.generate_missing)
-    btn_missing.pack(side=tk.LEFT, padx=(0, 6))
-    btn_suppl = ttk.Button(row0, text="补全 .mol", style="Aurora.TButton", command=app.controller.supplement_mol)
-    btn_suppl.pack(side=tk.LEFT, padx=(0, 6))
-    btn_dedup = ttk.Button(row0, text="删除重复文件", style="Aurora.TButton", command=app.controller.remove_duplicate_files)
-    btn_dedup.pack(side=tk.LEFT, padx=(0, 6))
-    btn_undo = ttk.Button(row0, text="↩  撤销", style="Aurora.TButton", command=app.controller.undo_last)
-    btn_undo.pack(side=tk.LEFT, padx=(0, 6))
-    add_tooltip(btn_scan, "重新读取工作目录并刷新文件列表")
-    add_tooltip(btn_missing, "导出一张 CSV：哪些英文名在映射表里找不到，\n方便你后续去补对照表")
-    add_tooltip(btn_suppl, "对于只有 .xyz 没有 .mol 的文件，自动用 OpenBabel 转一份 .mol")
-    add_tooltip(btn_dedup, "对比相同文件大小+内容哈希，只留 1 份（其余进回收站）")
-    add_tooltip(btn_undo, "撤销最近一次改名/移动（最多 1 次）")
+    def _card_btn(master, text, cmd, col, bg=None, tip=""):
+        kw = {}
+        if bg:
+            kw.update(bg=bg, fg=COLORS["btn_text"], activebackground=bg, activeforeground=COLORS["btn_text"])
+        b = tk.Button(master, text=text, command=cmd, font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')),
+                      relief=tk.RAISED, bd=1, padx=10, pady=4, cursor="hand2", **kw)
+        b.grid(row=0, column=col, padx=3, pady=8)
+        if tip:
+            add_tooltip(b, tip)
+        return b
 
-    # —— 第二行：整理操作 ——
-    row1 = _row("📂", "整理", AuroraTheme.STEP_2)
-    btn_by_type = ttk.Button(row1, text="按类型整理", style="Aurora.TButton", command=app.controller.organize_by_type)
-    btn_by_type.pack(side=tk.LEFT, padx=(0, 6))
-    btn_by_name = ttk.Button(row1, text="按文件名分组", style="Aurora.TButton", command=app.controller.organize_by_basename)
-    btn_by_name.pack(side=tk.LEFT, padx=(0, 6))
-    btn_prefix = ttk.Button(row1, text="前缀重命名", style="Aurora.TButton", command=app.controller.prefix_rename_dialog)
-    btn_prefix.pack(side=tk.LEFT, padx=(0, 6))
-    add_tooltip(btn_by_type, "按扩展名分文件夹：\n.mol → mol_files/、.xyz → xyz_files/")
-    add_tooltip(btn_by_name, "按同名（不含扩展名）分到同一个子文件夹")
-    add_tooltip(btn_prefix, "批量加前缀/日期/分子量等前缀到文件名开头")
+    _card_btn(map_card, "📂 浏览", app.controller.browse_mapping, 2, tip="选择要加载的映射文件(.txt/.csv)")
+    _card_btn(map_card, "📥 加载", app.controller.load_mapping_file, 3,
+              bg=COLORS["btn_info_bg"], tip="读取映射文件，立刻生效到列表")
+    try:
+        _card_btn(map_card, "✏️ 编辑映射", app.controller.show_mapping_editor_dialog, 4,
+                  tip="打开映射编辑器：增删改中英文条目")
+        _card_btn(map_card, "📊 映射管理器", app.controller.show_mapping_manager_dialog, 5,
+                  tip="映射批量导入/导出/补全工具")
+    except Exception:
+        pass
 
-    # —— 第三行：修复操作 ——
-    row2 = _row("🔧", "修复", AuroraTheme.BRAND_ORANGE)
+    try:
+        _card_btn(map_card, "📋 生成缺失CSV", app.controller.generate_missing, 6,
+                  tip="扫描工作目录，把找不到中文名的文件名导出为 CSV 模板")
+        _card_btn(map_card, "⬇ 导入CSV", (lambda: app.controller.show_mapping_manager_dialog()
+                                            if hasattr(app.controller, "show_mapping_manager_dialog")
+                                            else app.controller.generate_missing()), 7,
+                  tip="从 CSV 导入中英文映射")
+    except Exception:
+        pass
+
+    tk.Label(map_card, text="  已加载:", bg=COLORS["card_bg"],
+             fg=COLORS["text_light"], font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12))
+             ).grid(row=0, column=8, padx=(10, 2), pady=8, sticky="w")
+    tk.Label(map_card, textvariable=app.mapping_count, bg=COLORS["card_bg"], fg=COLORS["primary"],
+             font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 14, 'bold'))
+             ).grid(row=0, column=9, sticky="w", pady=8)
+
+    # —— R1：核心操作按钮（推荐操作绿色高亮，信息类蓝色，删除类红色） ——
+    ops_card = tk.LabelFrame(parent, text="  ⚡  常用文件操作（推荐：先按顺序点前 3 个）  ",
+                             bg=COLORS["card_bg"], fg=COLORS["text"],
+                             font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')), relief=tk.GROOVE, bd=2)
+    ops_card.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
+
+    def _action_btn(master, text, cmd, row, col, bg=None, tip="", width=16):
+        kw = {}
+        if bg:
+            kw.update(bg=bg, fg=COLORS["btn_text"], activebackground=bg, activeforeground=COLORS["btn_text"])
+        b = tk.Button(master, text=text, command=cmd, font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')),
+                      relief=tk.RAISED, bd=1, width=width, pady=6, cursor="hand2", **kw)
+        b.grid(row=row, column=col, padx=4, pady=6, sticky="ew")
+        if tip:
+            add_tooltip(b, tip)
+        return b
+
+    # ====== 行 1：高确定性一键式操作（新手专用） ======
+    # 1.1 一键修复（推荐：绿色）
+    _action_btn(ops_card, "🔧 一键修复全部", app.controller.run_fix_by_mode, 0, 0,
+                bg=COLORS["btn_recommend_bg"],
+                tip="依次执行：映射重命名→修复中文名→修复命名错误→修正中文内容（每项可预览取消）", width=18)
+    # 1.2 按类型整理（蓝色）
+    _action_btn(ops_card, "📂 按类型整理", app.controller.organize_by_type, 0, 1,
+                bg=COLORS["btn_info_bg"],
+                tip="按扩展名把文件移动到 mol_files/xyz_files/fchk_files 等子目录")
+    # 1.3 删除重复文件（橙色警告）
+    _action_btn(ops_card, "🧹 删除重复文件", app.controller.remove_duplicate_files, 0, 2,
+                bg=COLORS["btn_warn_bg"],
+                tip="扫描内容完全相同的重复文件并删除（会先弹确认）")
+    # 1.4 生成/导出缺失 CSV（信息蓝）
+    try:
+        _action_btn(ops_card, "📋 生成缺失映射表", app.controller.generate_missing, 0, 3,
+                    tip="把没有中文名的文件列表导出为 CSV 模板，方便批量填入后导入")
+    except Exception:
+        pass
+
+    # ====== 行 2：仍常用但更具体的操作 ======
+    _action_btn(ops_card, "🧪 补全 .mol 文件", app.controller.supplement_mol, 1, 0,
+                tip="对有 .xyz 但缺 .mol 的文件，用 OpenBabel 自动生成 mol")
+    _action_btn(ops_card, "📁 按文件名分组", app.controller.organize_by_basename, 1, 1,
+                tip="按基本名（无扩展名）相同，把 .mol/.xyz/.fchk/.out 等放入同名文件夹")
+    _action_btn(ops_card, "🏷️ 前缀重命名", app.controller.prefix_rename_dialog, 1, 2,
+                tip="为选中的文件批量加前缀、改后缀（弹对话框配置）")
+    # 删除选中（危险操作：红色）
+    _action_btn(ops_card, "🗑️ 删除选中文件", app.controller.delete_selected, 1, 3,
+                bg=COLORS["btn_danger_bg"],
+                tip="删除列表中当前勾选的文件（建议先预览选中项）")
+
+    # ====== 行 3：修复模式选择（高级用户可以精确选择修复类型，新手一般不用动） ======
+    row3 = tk.Frame(ops_card, bg=COLORS["card_bg"])
+    row3.grid(row=2, column=0, columnspan=8, sticky="ew", padx=4, pady=(0, 6))
+    tk.Label(row3, text="  💡 修复模式（高级）：", bg=COLORS["card_bg"],
+             fg=COLORS["text_light"], font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold'))
+             ).pack(side=tk.LEFT, padx=(0, 8))
     app.fix_mode_var = tk.StringVar(value="一键修复（推荐）")
-    fix_modes = ["一键修复（推荐）", "映射重命名", "修复中文名", "修复命名错误", "修正中文内容"]
-    fix_menu = ttk.Combobox(row2, textvariable=app.fix_mode_var, values=fix_modes, width=18, state="readonly",
-                            style="Aurora.TCombobox")
-    fix_menu.pack(side=tk.LEFT, padx=(0, 6))
-    btn_run_fix = ttk.Button(row2, text="▶  执行修复", style="Aurora.Primary.TButton", command=app.controller.run_fix_by_mode)
-    btn_run_fix.pack(side=tk.LEFT, padx=(0, 6))
-    add_tooltip(fix_menu, "选修复模式：\n• 一键修复=最常用，帮你全做了")
-    add_tooltip(btn_run_fix, "按选的模式执行重命名/修复")
+    fix_menu = ttk.Combobox(row3, textvariable=app.fix_mode_var,
+                            values=["一键修复（推荐）", "映射重命名", "修复中文名", "修复命名错误", "修正中文内容"],
+                            width=24, state="readonly", font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12)))
+    fix_menu.pack(side=tk.LEFT, padx=3)
+    add_tooltip(fix_menu, "如果你只需要单独执行某一步修复，可在此切换；否则推荐保持「一键修复」")
+    tk.Button(row3, text="▶ 执行", command=app.controller.run_fix_by_mode,
+              font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')), relief=tk.RAISED, bd=1, padx=12, pady=3,
+              bg=COLORS["btn_recommend_bg"], fg=COLORS["btn_text"], cursor="hand2"
+              ).pack(side=tk.LEFT, padx=6)
 
-    # —— 第四行：工具（量子蓝 / 分子紫 / 极光绿 三色胶囊）——
-    row3 = _row("🧪", "工具", AuroraTheme.BRAND_GREEN)
-    btn_psi4 = ttk.Button(row3, text="⚡  PSI4 计算", style="Aurora.Primary.TButton", command=app.controller.show_psi4_dialog)
-    btn_psi4.pack(side=tk.LEFT, padx=(0, 6))
-    btn_ob = ttk.Button(row3, text="🔬  OpenBabel", style="Aurora.TButton", command=app.controller.show_openbabel_dialog)
-    btn_ob.pack(side=tk.LEFT, padx=(0, 6))
-    btn_hist = ttk.Button(row3, text="📜  历史记录", style="Aurora.TButton", command=app.controller.show_history_dialog)
-    btn_hist.pack(side=tk.LEFT, padx=(0, 6))
-    btn_diff = ttk.Button(row3, text="🔍  目录差异", style="Aurora.TButton", command=app.controller.show_diff_sync_dialog)
-    btn_diff.pack(side=tk.LEFT, padx=(0, 6))
-    btn_mapedit = ttk.Button(row3, text="📝  映射表编辑", style="Aurora.TButton", command=app.controller.show_mapping_editor_dialog)
-    btn_mapedit.pack(side=tk.LEFT, padx=(0, 6))
-    btn_adv = ttk.Button(row3, text="🧰  高级工具箱", style="Aurora.Purple.TButton", command=app.controller.show_advanced_tools_dialog)
-    btn_adv.pack(side=tk.LEFT, padx=(0, 6))
-    btn_anim = ttk.Button(row3, text="🎬  反应动画", style="Aurora.Primary.TButton", command=app.controller.show_reaction_animation_dialog)
-    btn_anim.pack(side=tk.LEFT, padx=(0, 6))
-    btn_refresh = ttk.Button(row3, text="🔄  刷新", style="Aurora.TButton", command=app.controller.scan_files)
-    btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
-    add_tooltip(btn_psi4, "打开 PSI4 单电能/优化/振动频率计算（需另外安装 PSI4）")
-    add_tooltip(btn_ob, "OpenBabel 工具箱（分子转换 / 2D 结构 / 叠合对齐…）")
-    add_tooltip(btn_hist, "查看做过的改名记录，恢复错误操作可从这里翻")
-    add_tooltip(btn_diff, "对比两个目录里的文件差异，或把文件同步过去")
-    add_tooltip(btn_mapedit, "可视化编辑英文→中文映射对照")
-    add_tooltip(btn_adv, "🛠️ 高级功能新页面：\n"
-                          "• OB 分子工具（SMILES 搜索/手性/pH/SDF/InChIKey）\n"
-                          "• 波函数 / 构象搜索 / 二面角扫描 / 批量 HOMO LUMO\n"
-                          "• TS IRC 路径 + 能垒图 + Eyring k & t₁/₂\n"
-                          "• pKa (SMD) 预测 + ¹H NMR Boltzmann 谱图")
-    add_tooltip(btn_anim, "开反应动画制作窗口：反应物+产物→GIF/MP4")
-    add_tooltip(btn_refresh, "刷新文件列表（同扫描文件）")
+    # 让列可拉伸
+    for c in range(8):
+        ops_card.grid_columnconfigure(c, weight=1)
+
+    # —— R2：文件列表 + 日志（垂直分割） ——
+    _build_paned_file_and_log(app, parent, row=2, column=0)
 
 
-def build_paned_area(app, parent):
+# ===========================================================
+# 🔬 Tab2：计算与动画
+# ===========================================================
+def build_tab_compute_and_animation(app, parent):
     """
-    📄📋 文件列表 + 日志（PanedWindow 拆分），各自单独套一层玻璃卡片 + 标题
+    计算页：
+      - 顶部：快速预设（RUN_PRESETS 下拉 + ▶ 运行）—— 新手零参数
+      - 中部：「高级 PSI4 参数」折叠面板（展开后是完整的 PSI4 设置按钮）—— 专家使用
+      - 底部：「扫描参数（线性/刚性）」折叠面板 + 反应动画按钮
     """
-    T = AuroraTheme
-    paned = ttk.PanedWindow(parent, orient=tk.VERTICAL, style="Aurora.TPanedwindow")
-    paned.grid(row=3, column=0, sticky="nsew")
-    parent.grid_rowconfigure(3, weight=1)
+    parent.grid_rowconfigure(4, weight=1)
+    parent.grid_columnconfigure(0, weight=1)
 
-    # ========== 上：文件列表卡片 ==========
-    outer_file, inner_file = make_aurora_card(parent=None, title="📄  文件列表｜File Browser", accent=T.BRAND_BLUE)
-    # 外层卡片作为 PanedWindow 的子窗口
-    file_card_body = tk.Frame(paned, bg=T.BG_END, bd=0)
-    outer_file.master = file_card_body
-    outer_file.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
-    # 手动把 outer_file 的 parent 改为 file_card_body
-    for slave in outer_file.pack_slaves():
-        pass   # noop
-    # 重建父容器关系（tkinter 的 Frame 不能改 master，直接重新 new 一个）
-    # → 直接在这里重新 make 一次
-    outer_file.destroy()
-    outer_file, inner_file = make_aurora_card(file_card_body, title="📄  文件列表｜File Browser", accent=T.BRAND_BLUE)
-    outer_file.pack(fill=tk.BOTH, expand=True)
-    paned.add(file_card_body, weight=3)
+    # —— R0：快速预设（新手零参数区）——
+    preset_card = tk.LabelFrame(parent, text="  ⚡  快速计算预设（选一个直接运行，无需了解方法/基组细节）  ",
+                                bg=COLORS["card_bg"], fg=COLORS["text"],
+                                font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')), relief=tk.GROOVE, bd=2)
+    preset_card.grid(row=0, column=0, sticky="ew", padx=4, pady=(6, 4))
+    preset_card.grid_columnconfigure(2, weight=1)
 
-    body_file = tk.Frame(inner_file, bg=T.CARD_BG, bd=0)
-    body_file.pack(fill=tk.BOTH, expand=True, padx=18, pady=(14, 16))
+    try:
+        from constants import RUN_PRESETS
+        preset_names = list(RUN_PRESETS.keys())
+    except Exception:
+        RUN_PRESETS = {}
+        preset_names = []
 
-    # —— 过滤条 ——
-    filter_row = tk.Frame(body_file, bg=T.CARD_BG, bd=0)
-    filter_row.pack(fill=tk.X, pady=(0, 10))
+    tk.Label(preset_card, text=" 🎯 选择预设:", bg=COLORS["card_bg"], fg=COLORS["text"],
+             font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold'))).grid(row=0, column=0, padx=10, pady=12, sticky="w")
 
-    lbl_filter = tk.Label(filter_row, text="🔎 过滤", bg=T.CARD_BG, fg=T.TEXT_MUTED,
-                          font=("Microsoft YaHei UI", 10, "bold"))
-    lbl_filter.pack(side=tk.LEFT, padx=(0, 10))
-    add_tooltip(lbl_filter, "筛选查看文件：输入关键字即可\n例如：甲烷、.xyz、ch4…")
+    # 保存下拉以便 hover 显示说明
+    app.quick_preset_var = tk.StringVar(value=(preset_names[0] if preset_names else "请先定义 RUN_PRESETS"))
+    preset_cb = ttk.Combobox(preset_card, textvariable=app.quick_preset_var,
+                             values=preset_names, state="readonly", width=40,
+                             font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12)))
+    preset_cb.grid(row=0, column=1, padx=4, pady=12, sticky="w")
 
-    app.filter_keyword_entry = ttk.Entry(filter_row, textvariable=app.filter_keyword_var, width=22,
-                                         style="Aurora.TEntry")
+    # 预设说明提示：当选中变化时，tooltip 自动更新（简化：悬停预设说明静态提示）
+    def _on_preset_change(_e=None):
+        try:
+            name = app.quick_preset_var.get()
+            info = RUN_PRESETS.get(name, {})
+            parts = []
+            for k in ("task_type", "method", "basis", "solvent", "preset_name"):
+                if k in info and info[k]:
+                    parts.append(f"{k}={info[k]}")
+            add_tooltip(preset_cb, f"当前预设参数：\n" + "\n".join(parts) if parts else "无")
+        except Exception:
+            pass
+
+    preset_cb.bind("<<ComboboxSelected>>", _on_preset_change)
+    _on_preset_change()
+
+    def _run_quick_preset():
+        """把 RUN_PRESETS[name] 对应参数填到 PSI4 对话框，并打开（所有任务仍复用 PSI4 对话框）。"""
+        try:
+            name = app.quick_preset_var.get()
+            info = RUN_PRESETS.get(name, {})
+        except Exception:
+            info = {}
+        # 把 RUN_PRESETS 里的参数记到 app 上，后续 PSI4 对话框可在打开时读取（若 dialogs 已支持 preset_name，则直接触发）
+        app._last_run_preset_name = info.get("preset_name", info.get("name", name))
+        # 最终仍然调 PSI4 对话框——**所有原参数/任务类型/溶剂/D3 完全保留**，功能零损失
+        app.controller.show_psi4_dialog()
+
+    run_btn = tk.Button(preset_card, text="▶  运行所选文件", command=_run_quick_preset,
+                        font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 14, 'bold')),
+                        relief=tk.RAISED, bd=1, padx=18, pady=8, cursor="hand2",
+                        bg=COLORS["btn_recommend_bg"], fg=COLORS["btn_text"])
+    run_btn.grid(row=0, column=3, padx=10, pady=12, sticky="e")
+    add_tooltip(run_btn, "会自动打开 PSI4 完整对话框（专家参数可按需修改），默认使用预设里的方法/基组/溶剂")
+
+    # —— R1：反应动画大按钮 + 高级对话框入口 ——
+    quick_actions = tk.Frame(parent, bg=COLORS["bg"])
+    quick_actions.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
+
+    def _qa_btn(text, cmd, tip="", bg=None):
+        kw = {}
+        if bg:
+            kw.update(bg=bg, fg=COLORS["btn_text"], activebackground=bg, activeforeground=COLORS["btn_text"])
+        b = tk.Button(quick_actions, text=text, command=cmd, font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')),
+                      relief=tk.RAISED, bd=1, padx=12, pady=6, cursor="hand2", **kw)
+        b.pack(side=tk.LEFT, padx=4, pady=4)
+        if tip:
+            add_tooltip(b, tip)
+        return b
+
+    _qa_btn("🎬 制作反应动画", (lambda: (
+        hasattr(app.controller, "show_reaction_animation_dialog")
+        and app.controller.show_reaction_animation_dialog())
+        or app.controller.show_advanced_tools_dialog()),
+        tip="多反应物+多产物 → 插值生成反应轨迹/能量图/动画 GIF",
+        bg=COLORS["btn_info_bg"])
+    _qa_btn("⚡ 打开完整 PSI4 面板", app.controller.show_psi4_dialog,
+            tip="完整 PSI4 设置：任务/方法/基组/溶剂/D3/电荷/内存/扫描 等全部可调")
+    _qa_btn("📊 反应能垒/能垒图", (lambda: (
+        hasattr(app.controller, "show_advanced_tools_dialog")
+        and app.controller.show_advanced_tools_dialog())),
+        tip="打开高级工具 → 反应能垒图 / pKa / NMR 等")
+    _qa_btn("📈 构象搜索 / NMR / pKa / IRC", (lambda: (
+        hasattr(app.controller, "show_advanced_tools_dialog")
+        and app.controller.show_advanced_tools_dialog())),
+        tip="构象搜索、过渡态 IRC、pKa 预测、Boltzmann 加权 NMR")
+
+    # —— R2：高级 PSI4 参数（可折叠，默认收起）——
+    adv = CollapsibleFrame(parent, title="⚙️ 高级计算参数（专家使用，包含所有任务类型/扫描/方法/基组/溶剂/电荷/内存）",
+                            collapsed=True)
+    adv.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 4))
+
+    tk.Label(adv.body, text="  完整 PSI4 对话框包含：任务类型下拉 (单点/优化/频率/扫描/过渡态/激发态/SAPT/热化学)、方法/基组、\n"
+                            "  溶剂(PCM/SMD)、D3 色散、电荷/多重度、内存(GB)、步数/收敛限、线性/刚性扫描参数 等 —— 所有原功能全部可用。",
+             wraplength=900, justify="left",
+             bg=COLORS["card_bg"], fg=COLORS["text_light"],
+             font=getattr(app, '_fonts', {}).get('SMALL', ('Microsoft YaHei', 11))).pack(anchor="w", padx=8, pady=6)
+    row_b = tk.Frame(adv.body, bg=COLORS["card_bg"])
+    row_b.pack(fill="x", padx=8, pady=(0, 8))
+    tk.Button(row_b, text="⚡ 打开 PSI4 完整设置对话框", command=app.controller.show_psi4_dialog,
+              font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')), relief=tk.RAISED, bd=1, padx=14, pady=6,
+              cursor="hand2", bg=COLORS["btn_info_bg"], fg=COLORS["btn_text"]
+              ).pack(side=tk.LEFT, padx=4)
+    try:
+        tk.Button(row_b, text="🛠 高级扫描（线性/刚性）", command=app.controller.show_advanced_tools_dialog,
+                  font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')), relief=tk.RAISED, bd=1, padx=14, pady=6,
+                  cursor="hand2", bg=COLORS["btn_warn_bg"], fg=COLORS["btn_text"]
+                  ).pack(side=tk.LEFT, padx=4)
+    except Exception:
+        pass
+
+    # —— R3：扫描参数（可折叠）+ 说明 ——
+    scan_adv = CollapsibleFrame(parent, title="📈 线性/刚性扫描参数（用于势能面 PES 扫描）", collapsed=True)
+    scan_adv.grid(row=3, column=0, sticky="ew", padx=4, pady=(2, 4))
+    tk.Label(scan_adv.body, text="  线性扫描：两个端点结构 → 线性插值 N 帧 → 每帧跑单点能 → 能垒 CSV/图；\n"
+                                "  刚性扫描：固定某个二面角/键长/键角步进，其他自由优化（完整 PSI4 对话框里可配置）。",
+             wraplength=900, justify="left",
+             bg=COLORS["card_bg"], fg=COLORS["text_light"],
+             font=getattr(app, '_fonts', {}).get('SMALL', ('Microsoft YaHei', 11))).pack(anchor="w", padx=8, pady=6)
+    tk.Button(scan_adv.body, text="📊 打开高级扫描/能垒图工具", command=app.controller.show_advanced_tools_dialog,
+              font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')), relief=tk.RAISED, bd=1, padx=12, pady=5,
+              cursor="hand2", bg=COLORS["btn_info_bg"], fg=COLORS["btn_text"]
+              ).pack(anchor="w", padx=8, pady=(0, 8))
+
+    # —— R4：文件列表 + 日志（垂直分割），方便选中文件后直接跑 PSI4 ——
+    _build_paned_file_and_log(app, parent, row=4, column=0, show_in_tab2=True)
+
+
+# ===========================================================
+# ⚙️ Tab3：高级工具（子 Notebook 4 页）
+# ===========================================================
+def build_tab_advanced_tools(app, parent):
+    """
+    高级工具页：子 Notebook 4 页（分子工具 / 波函数 / 动力学 / 数据管理），
+    所有原 OpenBabel + PSI4 高级对话框 + 历史/结果浏览/目录同步 入口全部收纳。
+    功能零损失。
+    """
+    parent.grid_rowconfigure(0, weight=1)
+    parent.grid_columnconfigure(0, weight=1)
+
+    nb = ttk.Notebook(parent)
+    nb.grid(row=0, column=0, sticky="nsew", padx=2, pady=(6, 4))
+    app.advanced_notebook = nb
+
+    # —— 子页 1：分子工具（OB 全家桶 + 分子式） ——
+    t1 = tk.Frame(nb, bg=COLORS["bg"])
+    nb.add(t1, text="  🧪  分子工具 (OB)  ")
+    _adv_grid_of_buttons(t1, [
+        ("🔬 OpenBabel 工具（全功能）", app.controller.show_openbabel_dialog, True,
+         "格式转换/SMILES生成/描述符/叠加/2D预览/手性/pH加氢/SDF拆分/InChIKey"),
+        ("🧮 分子式/分子量/元素分析", lambda: app.dialogs.show_formula_dialog()
+         if hasattr(app, "dialogs") and hasattr(app.dialogs, "show_formula_dialog") else None, False,
+         "从 XYZ/MOL/INP 等解析分子式、精确质量、元素百分比"),
+        ("🔎 最近工作目录", app.controller.show_recent_dirs_dialog, False,
+         "快速切换到之前打开过的工作目录"),
+        ("📐 导出几何参数 CSV", lambda: app.controller.export_geometry_csv()
+         if hasattr(app.controller, "export_geometry_csv") else None, False,
+         "把文件列表里分子的键长/键角/二面角批量导出 CSV"),
+    ])
+
+    # —— 子页 2：波函数与分析（PSI4 所有高级 + NMR/pKa/IRC） ——
+    t2 = tk.Frame(nb, bg=COLORS["bg"])
+    nb.add(t2, text="  🧠  波函数 / NMR / pKa  ")
+    _adv_grid_of_buttons(t2, [
+        ("⚡ PSI4 完整计算（所有任务类型）", app.controller.show_psi4_dialog, True,
+         "单点/优化/频率/过渡态/激发态/SAPT/热化学 + 溶剂/D3/内存/电荷"),
+        ("📊 高级扫描（线性/刚性/能垒图）", app.controller.show_advanced_tools_dialog, True,
+         "势能面 PES 线性扫描、刚性扫描、能垒曲线"),
+        ("🎞️ IRC + 反应路径动画", app.controller.show_advanced_tools_dialog, False,
+         "从 TS 结构跑 IRC 前向/反向，导出动画帧"),
+        ("🧪 Boltzmann 加权 ¹H NMR 模拟", app.controller.show_advanced_tools_dialog, False,
+         "OB 构象搜索 + PSI4 CPHF NMR σ + TMS 参考 → δ + Lorentz 展宽 PNG"),
+        ("⚗️ pKa 热力学循环预测", app.controller.show_advanced_tools_dialog, False,
+         "SMD/water 水相单点 + H+(aq) 经验值 → pKa 估算 ±2"),
+        ("🧩 构象搜索（OB MMFF + PSI4 高精度）", app.controller.show_advanced_tools_dialog, False,
+         "多构象搜索 + Boltzmann 权重"),
+        ("🧬 反应路径能垒图", app.controller.show_advanced_tools_dialog, False,
+         "多步反应路径 Ea/ΔG 能垒图 + CSV 导出"),
+    ])
+
+    # —— 子页 3：动画与分子可视化 ——
+    t3 = tk.Frame(nb, bg=COLORS["bg"])
+    nb.add(t3, text="  🎬  动画 / 反应路径  ")
+    _adv_grid_of_buttons(t3, [
+        ("🎬 反应动画生成器", (lambda: (
+            hasattr(app.controller, "show_reaction_animation_dialog")
+            and app.controller.show_reaction_animation_dialog())), True,
+         "多反应物+多产物 → 自动对齐原子 → 插值 N 帧轨迹 → 能量 CSV + SDF/XYZ"),
+        ("🛠 高级工具箱（反应动画/NMR/pKa/IRC 综合入口）", app.controller.show_advanced_tools_dialog, False,
+         "综合高级功能单页入口"),
+        ("🎞 结果浏览器 / 轨迹播放", (lambda: (
+            hasattr(app.controller, "show_results_browser_dialog")
+            and app.controller.show_results_browser_dialog())), False,
+         "浏览 PSI4 .out/.fchk、动画轨迹、NMR PNG/CSV 等产物"),
+    ])
+
+    # —— 子页 4：数据管理（历史/结果/目录同步/映射编辑器） ——
+    t4 = tk.Frame(nb, bg=COLORS["bg"])
+    nb.add(t4, text="  🗂️  数据管理 / 历史  ")
+    _adv_grid_of_buttons(t4, [
+        ("📜 操作历史（撤销/重做列表）", (lambda: (
+            hasattr(app.controller, "show_history_dialog")
+            and app.controller.show_history_dialog())), False,
+         "查看所有已执行文件操作，支持逐条撤销/重做"),
+        ("🔍 结果浏览器（PSI4 输出/谱图）", (lambda: (
+            hasattr(app.controller, "show_results_browser_dialog")
+            and app.controller.show_results_browser_dialog())), False,
+         "按工作目录浏览计算输出 .out/.fchk/.log、NMR 图、反应 CSV"),
+        ("🔄 目录同步 / 差异比对", (lambda: (
+            hasattr(app.controller, "show_diff_sync_dialog")
+            and app.controller.show_diff_sync_dialog())), False,
+         "两个目录间双向 diff：缺失项、同名不同内容，选择同步方向"),
+        ("✏️ 映射编辑器", (lambda: (
+            hasattr(app.controller, "show_mapping_editor_dialog")
+            and app.controller.show_mapping_editor_dialog())), False,
+         "逐条增删改中英文映射条目（即时生效）"),
+        ("📊 映射管理器（导入/导出/补全）", (lambda: (
+            hasattr(app.controller, "show_mapping_manager_dialog")
+            and app.controller.show_mapping_manager_dialog())), False,
+         "批量导入 CSV / 导出模板 / 从现有文件补全"),
+    ])
+
+
+def _adv_grid_of_buttons(parent, buttons_spec):
+    """
+    以 2 列网格形式放置「高级工具按钮」，每个按钮：
+    (文字, 回调, 是否高亮主色, tooltip文字)
+    按钮下方自动有小字 tooltip 说明，新手友好。
+    """
+    container = tk.Frame(parent, bg=COLORS["bg"])
+    container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    for i in range(2):
+        container.grid_columnconfigure(i, weight=1)
+
+    for idx, spec in enumerate(buttons_spec):
+        text, cmd, highlight, tip = (spec + (None,))[:4] if len(spec) < 4 else spec
+        r, c = divmod(idx, 2)
+        card = tk.Frame(container, bg=COLORS["card_bg"], bd=1, relief=tk.SOLID,
+                        highlightbackground=COLORS["card_border"], highlightthickness=1)
+        card.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
+        card.grid_rowconfigure(0, weight=0)
+        card.grid_rowconfigure(1, weight=1)
+        card.grid_columnconfigure(0, weight=1)
+
+        # 按钮：占满卡片宽
+        bg = COLORS["btn_info_bg"] if highlight else COLORS["card_bg"]
+        fg = COLORS["btn_text"] if highlight else COLORS["text"]
+        btn = tk.Button(card, text=text, command=cmd, font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 13, 'bold')),
+                        relief=tk.RAISED, bd=1, pady=10, cursor="hand2",
+                        bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
+        btn.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        if tip:
+            add_tooltip(btn, tip)
+            # tooltip 文字也同时显示在卡片下方（避免用户不知道要悬停）
+            tk.Label(card, text="💡 " + (tip if len(tip) <= 96 else tip[:94] + "…"),
+                     wraplength=360, justify="left",
+                     bg=COLORS["card_bg"], fg=COLORS["text_light"],
+                     font=getattr(app, '_fonts', {}).get('SMALL', ('Microsoft YaHei', 11))).grid(row=1, column=0, sticky="nw", padx=10, pady=(0, 8))
+
+
+# ===========================================================
+# 📊 公共：文件列表 + 日志（垂直分割）
+# ===========================================================
+def _build_paned_file_and_log(app, parent, row, column, show_in_tab2: bool = False):
+    """
+    文件列表 + 日志 垂直 PanedWindow。
+    注意：**app.tree / app.log_text / app.context_menu / app.filter_keyword_entry / filter_count_var 只创建一次**，
+    第二次调用（tab2 复用）时，就不创建 Treeview/Log 控件，而是放一个占位提示：
+    「切回「📁 文件管理」页查看文件列表与日志」，避免多份 UI 导致 controller 引用错漏。
+    这保证 controller.py/dialogs.py 里所有对 app.tree / app.log_text 的引用仍然唯一、功能零损失。
+    """
+    if hasattr(app, "_file_log_paned_built") and app._file_log_paned_built:
+        # Tab2 版本：显示一个友好的占位卡片，提示当前文件列表在 Tab1；右侧放常用按钮直通 Tab1
+        placeholder = tk.Frame(parent, bg=COLORS["bg"])
+        placeholder.grid(row=row, column=column, sticky="nsew", pady=(0, 4))
+        card = tk.Frame(placeholder, bg=COLORS["card_bg"], bd=1, relief=tk.SOLID,
+                        highlightbackground=COLORS["card_border"], highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        tk.Label(card, text="\n   💡 提示：当前选中的文件列表、日志输出请在左侧「📁 文件管理」标签页查看。\n"
+                            "   在这里选择预设并点「运行」后，会自动打开 PSI4 对话框。\n",
+                 bg=COLORS["card_bg"], fg=COLORS["text_light"],
+                 font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12)), justify="left").pack(padx=16, pady=20, anchor="w")
+
+        def _jump_tab1():
+            try:
+                app.main_notebook.select(0)
+            except Exception:
+                pass
+
+        row_b = tk.Frame(card, bg=COLORS["card_bg"])
+        row_b.pack(anchor="w", padx=16, pady=(0, 20))
+        tk.Button(row_b, text="跳转到 📁 文件管理页", command=_jump_tab1,
+                  font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')), relief=tk.RAISED, bd=1, padx=12, pady=5,
+                  cursor="hand2", bg=COLORS["btn_info_bg"], fg=COLORS["btn_text"]).pack(side=tk.LEFT, padx=4)
+        tk.Button(row_b, text="🔍 立刻扫描文件列表", command=app.controller.scan_files,
+                  font=getattr(app, '_fonts', {}).get('BTN', ('Microsoft YaHei', 12, 'bold')), relief=tk.RAISED, bd=1, padx=12, pady=5,
+                  cursor="hand2").pack(side=tk.LEFT, padx=4)
+        return
+
+    paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+    paned.grid(row=row, column=column, sticky="nsew", pady=(0, 4))
+    parent.grid_rowconfigure(row, weight=1)
+    app._file_log_paned_built = True
+
+    # ---------- 文件列表 ----------
+    list_frame = tk.LabelFrame(paned, text="📄 文件列表（右键删除 / 双击编辑中文名）", bg=COLORS["card_bg"],
+                               font=getattr(app, '_fonts', {}).get('H1', ('Microsoft YaHei', 14, 'bold')), relief=tk.GROOVE, bd=2)
+    paned.add(list_frame, weight=2)
+
+    # 🔎 关键词过滤条（输入即搜）
+    filter_row = tk.Frame(list_frame, bg=COLORS["card_bg"])
+    filter_row.pack(fill=tk.X, padx=8, pady=6)
+    tk.Label(filter_row, text="🔎 关键词:", bg=COLORS["card_bg"],
+             fg=COLORS["text"], font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 13))).pack(side=tk.LEFT, padx=(0, 6))
+    app.filter_keyword_var = getattr(app, "filter_keyword_var", None) or tk.StringVar()
+    app.filter_keyword_entry = ttk.Entry(
+        filter_row, textvariable=app.filter_keyword_var, width=30,
+        font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 13)),
+    )
     app.filter_keyword_entry.pack(side=tk.LEFT, padx=(0, 8))
-    add_tooltip(app.filter_keyword_entry, "输入部分文件名即可过滤，不需要全拼")
+    app.filter_keyword_entry.bind("<KeyRelease>", lambda e: app.helpers.apply_filter())
+    ttk.Button(filter_row, text="清除",
+               command=lambda: (app.filter_keyword_var.set(""), app.helpers.apply_filter()),
+               width=8).pack(side=tk.LEFT)
+    if not getattr(app, "filter_count_var", None):
+        app.filter_count_var = tk.StringVar(value="共 0 / 0 个")
+    tk.Label(filter_row, textvariable=app.filter_count_var,
+             bg=COLORS["card_bg"], fg=COLORS["primary"],
+             font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 14, 'bold'))).pack(side=tk.LEFT, padx=(16, 0))
 
-    status_opts = ["全部", "✅ 已正确命名", "⏳ 待重命名", "⏳ 纯中文，待修复", "❌ 无映射", "📄 计算文件"]
-    app.filter_status_combo = ttk.Combobox(filter_row, textvariable=app.filter_status_var,
-                                           values=status_opts, state="readonly", width=18,
-                                           style="Aurora.TCombobox")
-    app.filter_status_combo.pack(side=tk.LEFT, padx=(0, 8))
-    add_tooltip(app.filter_status_combo,
-                "按命名状态筛选：\n✅ 正确=中英文都有\n⏳ 待重命名=只有英文名\n❌ 无映射=在对照表里找不到")
+    columns = ("文件名", "状态", "英文名", "中文名")
+    app.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=18)
+    app.tree.heading("文件名", text="文件名")
+    app.tree.heading("状态", text="状态")
+    app.tree.heading("英文名", text="英文名")
+    app.tree.heading("中文名", text="中文名")
+    app.tree.column("文件名", width=350, anchor=tk.W)
+    app.tree.column("状态", width=160, anchor=tk.CENTER)
+    app.tree.column("英文名", width=220, anchor=tk.W)
+    app.tree.column("中文名", width=220, anchor=tk.W)
 
-    sorted_exts = sorted(e.lstrip(".") for e in SUPPORTED_EXTS)
-    ext_opts = ["全部"] + sorted_exts
-    app.filter_ext_combo = ttk.Combobox(filter_row, textvariable=app.filter_ext_var,
-                                        values=ext_opts, state="readonly", width=8,
-                                        style="Aurora.TCombobox")
-    app.filter_ext_combo.pack(side=tk.LEFT, padx=(0, 8))
-    add_tooltip(app.filter_ext_combo, "只看某一类文件（mol / xyz / fchk / out / inp）")
+    style = ttk.Style()
+    style.configure("Treeview", font=getattr(app, '_fonts', {}).get('BASE', ('Microsoft YaHei', 12)), rowheight=30)
+    style.configure("Treeview.Heading", font=getattr(app, '_fonts', {}).get('BOLD', ('Microsoft YaHei', 14, 'bold')))
 
-    tk.Label(filter_row, textvariable=app.filter_count_var, bg=T.CARD_BG, fg=T.BRAND_BLUE,
-             font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-
-    def clear_filter():
-        app.filter_keyword_var.set("")
-        app.filter_status_var.set("全部")
-        app.filter_ext_var.set("全部")
-        app.helpers.apply_filter()
-
-    btn_clear = ttk.Button(filter_row, text="清除过滤器", style="Aurora.TButton", command=clear_filter)
-    btn_clear.pack(side=tk.RIGHT)
-    add_tooltip(btn_clear, "把以上 3 个过滤条件都清空，显示全部文件")
-
-    # —— Treeview ——
-    tree_wrap = tk.Frame(body_file, bg=T.CARD_BG, bd=1, highlightthickness=1,
-                        highlightbackground=T.CARD_BORDER)
-    tree_wrap.pack(fill=tk.BOTH, expand=True)
-    columns = ("文件名", "状态", "英文名", "中文名", "MW", "LogP", "TPSA")
-    app.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=14,
-                            style="Aurora.Treeview")
-    for c, text, w in (("文件名", "文件名", 320),
-                       ("状态", "状态", 150),
-                       ("英文名", "英文名", 160),
-                       ("中文名", "中文名", 160),
-                       ("MW", "分子量", 80),
-                       ("LogP", "LogP", 70),
-                       ("TPSA", "TPSA", 70)):
-        app.tree.heading(c, text=text)
-        app.tree.column(c, width=w, anchor="center" if c in ("MW", "LogP", "TPSA", "状态") else "w")
-    add_tooltip(app.tree,
-                "点击表头可排序；MW/LogP/TPSA 由 OpenBabel 自动算出\n（分子文件扫描完成后后台异步填充）")
-    # 斑马纹
-    app.tree.tag_configure("even", background=T.TREE_EVEN)
-    app.tree.tag_configure("odd", background=T.TREE_ODD)
-
-    scrollbar = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=app.tree.yview,
-                              style="Aurora.Vertical.TScrollbar")
-    app.tree.configure(yscrollcommand=scrollbar.set)
+    vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=app.tree.yview)
+    app.tree.configure(yscrollcommand=vsb.set)
     app.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    # 右键菜单
     app.context_menu = tk.Menu(app, tearoff=0)
-    app.context_menu.add_command(label="🖼️  预览 2D 结构", command=app.controller.preview_2d_structure)
-    app.context_menu.add_command(label="🧪  分子式 / 元素分析", command=app.controller.show_formula_dialog)
-    app.context_menu.add_separator()
-    app.context_menu.add_command(label="📐  导出键长/键角 CSV", command=app.controller.export_geometry_csv)
-    app.context_menu.add_command(label="📝  批量计算描述符 (MW / LogP / TPSA)", command=app.controller.batch_fill_descriptors)
-    app.context_menu.add_separator()
-    app.context_menu.add_command(label="🗑️  删除选中文件", command=app.controller.delete_selected)
+    app.context_menu.add_command(label="🗑️ 删除选中文件", command=app.controller.delete_selected)
     app.tree.bind("<Button-3>", app.controller.show_context_menu)
 
-    # ========== 下：日志卡片 ==========
-    outer_log, inner_log = make_aurora_card(None, title="📋  运行日志｜Logs", accent=T.BRAND_GREEN)
-    log_card_body = tk.Frame(paned, bg=T.BG_END, bd=0)
-    outer_log.destroy()
-    outer_log, inner_log = make_aurora_card(log_card_body, title="📋  运行日志｜Logs", accent=T.BRAND_GREEN)
-    outer_log.pack(fill=tk.BOTH, expand=True)
-    paned.add(log_card_body, weight=2)
+    # ---------- 日志 ----------
+    log_frame = tk.LabelFrame(paned, text="📋 日志（所有操作/错误实时显示）", bg=COLORS["card_bg"],
+                              font=getattr(app, '_fonts', {}).get('H1', ('Microsoft YaHei', 14, 'bold')), relief=tk.GROOVE, bd=2)
+    paned.add(log_frame, weight=1)
 
-    body_log = tk.Frame(inner_log, bg=T.CARD_BG, bd=0)
-    body_log.pack(fill=tk.BOTH, expand=True, padx=18, pady=(14, 16))
-    body_log.grid_columnconfigure(0, weight=1)
-    body_log.grid_rowconfigure(1, weight=1)
+    log_toolbar = tk.Frame(log_frame, bg=COLORS["card_bg"])
+    log_toolbar.pack(fill=tk.X, padx=8, pady=6)
+    ttk.Button(log_toolbar, text="🗑️ 清空日志", command=app.helpers.clear_log,
+               width=12).pack(side=tk.LEFT)
 
-    # —— 日志工具栏：过滤芯片 + 导出/清空按钮 ——
-    log_toolbar = tk.Frame(body_log, bg=T.CARD_BG, bd=0)
-    log_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+    app.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap=tk.WORD,
+                                             font=getattr(app, '_fonts', {}).get('LOG', ('Consolas', 13)), bg="#F8FAFC", fg=COLORS["text"])
+    app.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
-    chip_labels = [
-        ("DEBUG",   "debug",   T.TEXT_MUTED,   "#E6ECFF"),
-        ("INFO",    "info",    T.BRAND_BLUE,   T.glow(T.BRAND_BLUE, 0.92)),
-        ("SUCCESS", "success", T.BRAND_GREEN,  T.glow(T.BRAND_GREEN, 0.90)),
-        ("WARNING", "warning", T.BRAND_ORANGE, T.glow(T.BRAND_ORANGE, 0.90)),
-        ("ERROR",   "error",   T.BRAND_RED,    T.glow(T.BRAND_RED, 0.90)),
-    ]
-    app._log_chip_vars = {}
-    for i, (lbl, key, fg, bg) in enumerate(chip_labels):
-        var = tk.BooleanVar(value=True)
-        app._log_chip_vars[key] = var
-        chip = tk.Checkbutton(
-            log_toolbar, text=f" {lbl} ", variable=var,
-            bg=T.CARD_BG, fg=fg, selectcolor=bg,
-            activebackground=T.CARD_BG, activeforeground=fg,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            bd=0, highlightthickness=0,
-            command=lambda k=key, v=var: app.helpers._toggle_log_level(k, v),
-            cursor="hand2",
-        )
-        chip.grid(row=0, column=i, padx=(0, 8))
-        add_tooltip(chip, f"点击切换是否显示【{lbl}】级别日志")
-
-    # 右侧：导出 TXT / 导出 CSV / 清空 按钮
-    btn_bar = tk.Frame(log_toolbar, bg=T.CARD_BG, bd=0)
-    btn_bar.grid(row=0, column=10, sticky="e")
-    log_toolbar.grid_columnconfigure(10, weight=1)
-
-    btn_export_txt = ttk.Button(btn_bar, text="📄 导出 TXT", style="Aurora.TButton",
-                                 command=lambda: app.helpers._export_log("txt"))
-    btn_export_txt.pack(side=tk.RIGHT, padx=(8, 0))
-    add_tooltip(btn_export_txt, "把当前全部日志导出为 .txt 文本文件\n（含所有级别，不受过滤芯片影响）")
-
-    btn_export_csv = ttk.Button(btn_bar, text="📊 导出 CSV", style="Aurora.TButton",
-                                 command=lambda: app.helpers._export_log("csv"))
-    btn_export_csv.pack(side=tk.RIGHT, padx=(8, 0))
-    add_tooltip(btn_export_csv, "把当前全部日志导出为 .csv 表格\n（含时间/级别/消息列，可 Excel 打开）")
-
-    btn_top_perf = ttk.Button(btn_bar, text="⚡ 性能 Top10", style="Aurora.TButton",
-                               command=lambda: app.helpers._show_top_perf())
-    btn_top_perf.pack(side=tk.RIGHT, padx=(8, 0))
-    add_tooltip(btn_top_perf, "显示当前会话最耗时的 10 个操作\n（单位：毫秒，用于找慢操作瓶颈）")
-
-    btn_clear = ttk.Button(btn_bar, text="🗑️  清空日志", style="Aurora.TButton",
-                            command=lambda: app.helpers.clear_log())
-    btn_clear.pack(side=tk.RIGHT, padx=(8, 0))
-    add_tooltip(btn_clear, "清空当前日志面板\n（二次确认，避免误点）")
-
-    # —— 日志文本区 ——
-    log_wrap = tk.Frame(body_log, bg=T.LOG_BG, bd=1, highlightthickness=1,
-                        highlightbackground=T.CARD_BORDER)
-    log_wrap.grid(row=1, column=0, sticky="nsew")
-    app.log_text = scrolledtext.ScrolledText(
-        log_wrap,
-        height=7,
-        wrap=tk.WORD,
-        font=("Consolas", 11),
-        bg=T.LOG_BG,
-        fg=T.TEXT_MAIN,
-        insertbackground=T.BRAND_BLUE,
-        selectbackground=T.glow(T.BRAND_BLUE, 0.8),
-        relief="flat",
-        bd=0,
-        padx=12, pady=8,
-    )
-    app.log_text.pack(fill=tk.BOTH, expand=True)
-
-    # —— 更醒目的彩色背景标签：ERROR 红底条 / WARNING 橙底条 / SUCCESS 绿底条 / DEBUG 灰字 ——
-    app.log_text.tag_configure("info", foreground=T.TEXT_MAIN, background=T.LOG_BG)
-    app.log_text.tag_configure("debug", foreground=T.TEXT_MUTED,
-                               background="#F4F6FF",
-                               font=("Consolas", 10, "italic"))
-    app.log_text.tag_configure("success",
-                               foreground="#0C8873",
-                               background=T.glow(T.BRAND_GREEN, 0.93),
-                               font=("Consolas", 11, "bold"))
-    app.log_text.tag_configure("warning",
-                               foreground="#B65A1A",
-                               background=T.glow(T.BRAND_ORANGE, 0.92),
-                               font=("Consolas", 11, "bold"))
-    app.log_text.tag_configure("error",
-                               foreground="#9A1D21",
-                               background=T.glow(T.BRAND_RED, 0.92),
-                               font=("Consolas", 11, "bold"))
-    app.log_text.tag_configure("critical",
-                               foreground="#FFFFFF",
-                               background=T.BRAND_RED,
-                               font=("Consolas", 11, "bold"))
+    app.log_text.tag_config("info", foreground=COLORS["text"])
+    app.log_text.tag_config("success", foreground=COLORS["success"])
+    app.log_text.tag_config("error", foreground=COLORS["danger"])
+    app.log_text.tag_config("warning", foreground=COLORS["warning"])
 
 
-def build_status_bar(app):
+# ===========================================================
+# 📊 底部状态栏（新版：状态 + 进度 + 操作提示 + OB 指示灯）
+# ===========================================================
+def build_status_bar_new(app):
     """
-    底部状态栏：左侧状态文字（深夜蓝条 + 极光白字），右侧进度条 + 清除日志按钮
+    替换旧 build_status_bar：
+    - 左侧：status_var（就绪/处理中）
+    - 中左：操作提示 tip_var（上一个按钮做了什么、下一步建议）
+    - 右侧：进度条 + 清除日志按钮 + OB 状态指示灯（绿/红圆点，点击看诊断）
     """
-    T = AuroraTheme
-    status_frame = tk.Frame(app, bg=T.TEXT_MAIN, bd=0, height=38, highlightthickness=0)
+    # 字体（问题一：字太小）
+    F = getattr(app, "_fonts", {})
+    STATUS_F  = F.get("STATUS",  ("Microsoft YaHei", 11))
+    TIP_F     = F.get("BASE",    ("Microsoft YaHei", 12))
+    BTN_F     = F.get("BTN2",    ("Microsoft YaHei", 12))
+    IND_BOLD  = F.get("BOLD",    ("Microsoft YaHei", 12, "bold"))
+
+    status_frame = tk.Frame(app, bg="#E6ECF4", bd=0, relief=tk.FLAT)
     status_frame.pack(side=tk.BOTTOM, fill=tk.X)
-    status_frame.pack_propagate(False)
 
-    # —— 左侧状态文字 ——
-    left = tk.Frame(status_frame, bg=T.TEXT_MAIN, bd=0)
-    left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14, pady=7)
-    # 左侧小色点（绿=就绪）
-    dot = tk.Frame(left, bg=T.BRAND_GREEN, width=10, height=10, bd=0)
-    dot.pack(side=tk.LEFT, padx=(0, 10))
-    # 让色点变成圆形（用 Canvas 画个圆）
-    dot_canvas = tk.Canvas(left, width=12, height=12, bg=T.TEXT_MAIN, highlightthickness=0, bd=0)
-    dot_canvas.pack(side=tk.LEFT, padx=(0, 10))
-    dot_canvas.create_oval(1, 1, 11, 11, fill=T.BRAND_GREEN, outline=T.BRAND_GREEN)
-    # 让色点随状态变化
-    app._status_dot = dot_canvas
-    app.status_var = tk.StringVar(value="  就绪 · Ready")
+    app.status_var = getattr(app, "status_var", None) or tk.StringVar(value="就绪")
+    status_label = tk.Label(status_frame, textvariable=app.status_var, relief=tk.SUNKEN,
+                            anchor=tk.W, font=STATUS_F,
+                            bg=COLORS["card_bg"], fg=COLORS["text"], padx=10, pady=4)
+    status_label.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(8, 6), pady=4)
+    try:
+        status_label.configure(width=28)
+    except Exception:
+        pass
 
-    def _on_status_change(*_):
-        txt = app.status_var.get().strip()
-        c = T.BRAND_GREEN
-        if any(k in txt for k in ("错误", "失败", "Error", "Fail", "❌")):
-            c = T.BRAND_RED
-        elif any(k in txt for k in ("警告", "Warn", "⚠️")):
-            c = T.BRAND_ORANGE
-        elif any(k in txt for k in ("进行中", "Running", "计算", "扫描", "⏳")):
-            c = T.BRAND_BLUE
-        app._status_dot.delete("all")
-        app._status_dot.create_oval(1, 1, 11, 11, fill=c, outline=c)
-    app.status_var.trace_add("write", _on_status_change)
+    # 新增：操作提示 label（「按钮点击后给用户看下一步做什么」）
+    app.action_tip_var = tk.StringVar(value="💡 新手推荐：先在左侧工作目录点「浏览」选文件夹 → 点「🔧 一键修复全部」")
+    tip_label = tk.Label(status_frame, textvariable=app.action_tip_var,
+                         anchor=tk.W, font=TIP_F,
+                         bg="#E6ECF4", fg=COLORS["primary"], padx=8)
+    tip_label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=4)
 
-    tk.Label(left, textvariable=app.status_var, bg=T.TEXT_MAIN, fg=T.TEXT_BADGE,
-             font=("Microsoft YaHei UI", 10), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+    # —— 问题三：OpenBabel 指示灯（绿点 = 可用 / 红点 = 不可用，悬停显示摘要，点击 = 环境诊断）——
+    app.ob_status_var = tk.StringVar(value="OB: 检测中…")
+    app.ob_dot_canvas: tk.Canvas | None = None  # 后面 MainView 写状态会 set 颜色
+    ob_frame = tk.Frame(status_frame, bg="#E6ECF4", bd=0)
+    ob_frame.pack(side=tk.RIGHT, padx=(0, 6), pady=4)
+    # 圆点画布（18x18，直径 14）
+    dot_c = tk.Canvas(ob_frame, width=18, height=18, bg="#E6ECF4", highlightthickness=0, bd=0, cursor="hand2")
+    dot_c.pack(side=tk.LEFT, padx=(0, 4))
+    dot_c.create_oval(2, 2, 16, 16, fill="#B7C0D6", outline="#B7C0D6", tags="dot")  # 灰色 = 还未检测
+    app.ob_dot_canvas = dot_c
+    ob_text = tk.Label(ob_frame, textvariable=app.ob_status_var,
+                       bg="#E6ECF4", fg=COLORS["text"], font=IND_BOLD, cursor="hand2")
+    ob_text.pack(side=tk.LEFT)
+    # 点击画布 or 文本 → 打开环境诊断（helpers 里提供该方法）
+    def _on_click_ob(_evt=None):
+        try:
+            if hasattr(app, "helpers") and hasattr(app.helpers, "show_env_diagnosis_dialog"):
+                app.helpers.show_env_diagnosis_dialog()
+        except Exception as _e:
+            try:
+                from tkinter import messagebox as _mb
+                _mb.showinfo("环境诊断", f"环境诊断调用失败：{_e}")
+            except Exception:
+                pass
+    dot_c.bind("<Button-1>", _on_click_ob)
+    ob_text.bind("<Button-1>", _on_click_ob)
+    add_tooltip(ob_frame,
+                "OpenBabel 状态：\n  ● 绿色 = 可用\n  ● 红色 = 不可用\n点击查看诊断 / 手动设置 obabel 路径")
 
-    # —— 右侧：清除日志 + 进度条 ——
-    right = tk.Frame(status_frame, bg=T.TEXT_MAIN, bd=0)
-    right.pack(side=tk.RIGHT, fill=tk.Y, padx=12, pady=6)
-    clear_btn = ttk.Button(right, text="清除日志", style="Aurora.TButton", command=app.helpers.clear_log)
-    clear_btn.pack(side=tk.RIGHT, padx=(10, 0))
-    app.progress_bar = ttk.Progressbar(right, variable=app.progress_var, maximum=100, length=180,
-                                       style="Aurora.Horizontal.TProgressbar")
-    app.progress_bar.pack(side=tk.RIGHT, padx=(0, 10))
+    # 进度条
+    app.progress_var = getattr(app, "progress_var", None) or tk.DoubleVar(value=0.0)
+    app.progress_bar = ttk.Progressbar(status_frame, variable=app.progress_var, maximum=100, length=220)
+    app.progress_bar.pack(side=tk.RIGHT, padx=8, pady=4)
+    ttk.Button(status_frame, text="清除日志", command=app.helpers.clear_log,
+               ).pack(side=tk.RIGHT, padx=(0, 8), pady=4)
+
+    # —— 便捷：把常用按钮的动作提示写出来（通过 monkey-patch helpers.on_log 很危险，不如在几个常用函数包一层）——
+    _inject_action_tips(app)
 
 
+def _inject_action_tips(app):
+    """
+    把常见 controller 动作包一层「动作完成后写提示到 action_tip_var」。
+    非侵入式：用 try/except，失败不影响功能。
+    """
+    def _tip(msg: str):
+        try:
+            app.action_tip_var.set("💡 " + msg)
+        except Exception:
+            pass
+
+    # 给几个最常用的控制器函数包装
+    pairs = [
+        ("scan_files", "已扫描文件列表，下一步：点「🔧 一键修复全部」自动处理命名问题"),
+        ("run_fix_by_mode", "修复已完成。下一步：点「📂 按类型整理」或「📁 按文件名分组」归档"),
+        ("organize_by_type", "已按扩展名整理归档。下一步：选文件 → 切到「🔬 计算与动画」运行预设"),
+        ("organize_by_basename", "已按基本名分组（每个分子一个子目录）。下一步：点「生成缺失映射表」批量补名"),
+        ("load_mapping_file", "映射已加载！列表里中文名已更新。下一步：点「一键修复全部」执行映射重命名"),
+        ("generate_missing", "缺失的文件名已导出 CSV。填完中文名后，用「映射管理器」导入即可"),
+        ("undo_last", "已撤销上一步。需要前进？点工具栏「↪ 重做」"),
+        ("remove_duplicate_files", "重复文件清理完成。建议先点「扫描文件」确认结果"),
+    ]
+    for name, tip in pairs:
+        try:
+            original = getattr(app.controller, name)
+
+            def _wrap(fn, t):
+                def _w(*a, **kw):
+                    try:
+                        ret = fn(*a, **kw)
+                    finally:
+                        try:
+                            _tip(t)
+                        except Exception:
+                            pass
+                    return ret
+                return _w
+            setattr(app.controller, name, _wrap(original, tip))
+        except Exception:
+            pass

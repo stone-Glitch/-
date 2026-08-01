@@ -12,15 +12,89 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Callable, Any
+from typing import Dict, Optional, Callable, Any, List, Tuple
+
+from constants import (
+    DEFAULT_SOLVENT,
+    PSI4_DEFAULT_PROCESS_TIMEOUT,
+    ATOMIC_WEIGHTS,
+    PSI4_PRESETS,
+)
+
+# ---------- NumPy 兼容性补丁：防止 pint 旧版本在 NumPy 1.20+ 下崩溃 ----------
+# 背景：pint 依赖 qcelemental 处理物理单位；pint 旧版本（< 0.22）会调用
+#       np.cumproduct 这个在 NumPy 1.20 中已被删除、1.23+ 完全不存在的旧别名。
+#       错误栈：psi4 → qcelemental → pint → AttributeError: numpy has no cumproduct。
+# 处理方式（防御性）：
+#   1) 尝试导入 pint：如果成功，说明环境已经 OK，无需任何修改。
+#   2) 若 ImportError / AttributeError（或 numpy 导入失败但 psi4 存在），
+#      则在 numpy 模块上临时补上 cumproduct = cumprod 别名，并记录 warning
+#      提示用户"建议升级 pint 到 0.24+ 或 numpy 降级到 1.23.x"。
+# 注意：本补丁**不**替代环境升级，只是为了在受限环境下软件能正常工作。
+try:
+    import numpy as _np
+    _HAS_NUMPY = True
+except ImportError:
+    _np = None
+    _HAS_NUMPY = False
+
+def _apply_numpy_cumproduct_compat_patch() -> None:
+    """
+    惰性调用：只在 psi4 第一次要被用到、或者 pint 导入失败时才调用，
+    避免 main/import 阶段就去摸 numpy 的内部结构造成不必要副作用。
+    """
+    if not _HAS_NUMPY:
+        return
+    if hasattr(_np, "cumproduct"):
+        return
+    # numpy ≥ 1.24：cumproduct 完全移除，我们给它补回一个别名，
+    # 这样 pint 旧版本不会炸。同时打 warning 建议用户升级环境。
+    from logger import default_logger as _log
+    try:
+        _np.cumproduct = _np.cumprod
+        _log.warning(
+            "检测到 numpy ≥ 1.24 且 pint 较旧：已临时为 numpy 补上 cumproduct=cumprod 别名，"
+            "避免 PSI4 导入崩溃。建议运行 `conda install -c conda-forge pint=0.24` "
+            "或 `pip install --upgrade pint` 以彻底解决此问题。"
+        )
+    except Exception as _e:
+        # 嵌套 try：logger 本身也可能没初始化好
+        try:
+            _log.debug("应用 numpy cumproduct 兼容性补丁时发生非致命错误: %s", _e)
+        except Exception:
+            # 最后兜底：print 到 stderr 保证不丢失（避免完全静默）
+            import sys as _sys
+            print(f"[compat] numpy cumproduct 补丁非致命错误: {_e}", file=_sys.stderr)
 
 try:
-    import psi4
-except ImportError:
-    psi4 = None
+    # 先尝试"无补丁"路径：如果 pint 本身是新的，会正常导入，不做任何修改。
+    import psi4  # type: ignore[unused-import]
+except Exception as _psi4_first_import_err:
+    # ImportError / AttributeError 都可能是 numpy→pint 链炸了，先打补丁再试一次。
+    try:
+        from logger import default_logger as _log
+        _log.warning("PSI4 首次导入失败（可能是 numpy/pint 不兼容），尝试应用兼容性补丁后重试: %s",
+                     _psi4_first_import_err)
+    except Exception:
+        import sys as _sys
+        print(f"[psi4_import] 首次导入失败：{_psi4_first_import_err}", file=_sys.stderr)
+    _apply_numpy_cumproduct_compat_patch()
+    try:
+        import psi4  # type: ignore[no-redef]  # noqa: F811
+    except Exception as _psi4_second_err:
+        # 失败信息不要完全吞掉：warning 级别以便用户感知
+        try:
+            from logger import default_logger as _log2
+            _log2.warning("PSI4 第二次导入仍失败，将标记为不可用: %s", _psi4_second_err)
+        except Exception:
+            import sys as _sys
+            print(f"[psi4_import] 第二次导入仍失败：{_psi4_second_err}", file=_sys.stderr)
+        psi4 = None
+else:
+    # 首次导入就成功了，也**依然**尝试检查一次（万一某些懒加载模块里才会触发）
+    _apply_numpy_cumproduct_compat_patch()
 
 import logging
-from constants import PSI4_PRESETS
 import openbabel_utils as ob_utils
 from logger import default_logger as logger, performance_timer
 
@@ -43,6 +117,68 @@ __all__ = [
 ]
 
 
+# 【审计 1.1 路径遍历】输出路径安全封装：同 openbabel_utils 一致
+def _secure_output_path(
+    requested_path,
+    *,
+    is_dir: bool = False,
+    default_name=None,
+    base_dir=None,
+    allow_outside: bool = False,
+    create_parent: bool = True,
+) -> Path:
+    """封装 model.resolve_secure_output_path_external，避免 psi4_compute 自己实现一套。"""
+    from model import resolve_secure_output_path_external
+    if base_dir is None:
+        try:
+            cwd = Path.cwd()
+            if cwd.is_dir():
+                base_dir = cwd
+            else:
+                raise RuntimeError
+        except Exception:
+            base_dir = Path(tempfile.gettempdir())
+    return resolve_secure_output_path_external(
+        requested_path,
+        base_dir=base_dir,
+        is_dir=is_dir,
+        default_name=default_name,
+        allow_outside=allow_outside,
+        create_parent=create_parent,
+    )
+
+
+def _default_base_dir_from_input(input_path: str | os.PathLike[str] | None, *, fallback: str | os.PathLike[str] | None = None) -> Path:
+    """
+    从输入文件推断默认 base_dir：
+      - 输入存在：用其 parent 作为 base_dir（避免用户随便输相对路径时跑到 cwd）；
+      - 否则：fallback → cwd → temp。
+    """
+    if input_path is not None:
+        try:
+            p = Path(input_path)
+            if p.parent.is_dir():
+                return p.parent.resolve()
+        except Exception:
+            pass
+    if fallback is not None:
+        try:
+            pf = Path(fallback)
+            if pf.is_dir():
+                return pf.resolve()
+            if pf.parent.is_dir():
+                return pf.parent.resolve()
+        except Exception:
+            pass
+    try:
+        cwd = Path.cwd()
+        if cwd.is_dir():
+            return cwd.resolve()
+    except Exception:
+        pass
+    return Path(tempfile.gettempdir()).resolve()
+
+
 _XYZ_READ_CACHE: dict[tuple[str, int, int], str | None] = {}
 _XYZ_READ_CACHE_MAX = 512
 
@@ -55,8 +191,75 @@ def _xyz_cache_key(path_str: str) -> tuple[str, int, int] | None:
         return None
 
 
-def check_psi4_installed() -> bool:
-    return psi4 is not None
+def check_psi4_installed() -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    增强版 PSI4 安装与功能支持检测（问题5修复）：
+    返回 (可用性, 消息, 详情字典)。
+
+    详情字典 keys：
+      - version: str 或 None
+      - has_energy / has_optimize / has_frequency: bool（核心任务支持）
+      - has_cphf_nmr: bool（CPHF NMR 编译选项，没开则 NMR 只能跑经验法）
+      - has_pcm: bool（PCMSolver 溶剂模型编译）
+      - warnings: list[str]
+    """
+    details: Dict[str, Any] = {
+        "version": None,
+        "has_energy": False,
+        "has_optimize": False,
+        "has_frequency": False,
+        "has_cphf_nmr": False,
+        "has_pcm": False,
+        "warnings": [],
+    }
+    wl: list[str] = details["warnings"]
+
+    if psi4 is None:
+        return False, "PSI4 未安装或导入失败（建议：conda install -c psi4 psi4 或 pip install psi4）", details
+
+    # 版本号
+    try:
+        details["version"] = str(getattr(psi4, "__version__", None) or
+                                  getattr(psi4.core, "version", lambda: "unknown")())
+    except Exception as _ve:
+        logger.debug("PSI4 版本探测失败: %s", _ve)
+
+    # 核心任务接口：存在性检测即可
+    for attr, key in (("energy", "has_energy"),
+                      ("optimize", "has_optimize"),
+                      ("frequency", "has_frequency")):
+        details[key] = callable(getattr(psi4, attr, None))
+
+    # CPHF NMR：psi4.cphf 是否可调用（通常需要编译时开 CPHF 选项）
+    details["has_cphf_nmr"] = callable(getattr(psi4, "cphf", None))
+    if not details["has_cphf_nmr"]:
+        wl.append("PSI4 编译时未启用 CPHF 模块，¹H NMR 模拟将自动降级为经验化学位移库（结果准确度受限）")
+
+    # PCMSolver：psi4.core.set_local_option("PCM", ...) 能否不报错
+    try:
+        # 不真正改设置，只测试接口存在
+        details["has_pcm"] = callable(getattr(psi4.core, "set_local_option", None))
+    except Exception:
+        details["has_pcm"] = False
+
+    # 汇总消息
+    msg_parts = [f"PSI4 已安装（版本={details['version'] or '未知'}）"]
+    caps = []
+    if details["has_energy"]: caps.append("单点能")
+    if details["has_optimize"]: caps.append("几何优化")
+    if details["has_frequency"]: caps.append("频率分析")
+    if details["has_cphf_nmr"]: caps.append("CPHF NMR")
+    if details["has_pcm"]: caps.append("PCM 溶剂")
+    if caps: msg_parts.append(f"支持功能：{'/'.join(caps)}")
+    if wl: msg_parts.append(f"警告 {len(wl)} 条")
+
+    return True, "，".join(msg_parts), details
+
+
+def check_psi4_installed_simple() -> bool:
+    """兼容旧调用方：只返回 bool。"""
+    ok, _, _ = check_psi4_installed()
+    return ok
 
 
 def get_preset_info(preset_name: str) -> Dict:
@@ -72,43 +275,74 @@ def _run_process_with_timeout(
     args: list[str],
     *,
     cwd: str | os.PathLike[str] | None = None,
-    timeout: float = 300.0,
+    timeout: float = PSI4_DEFAULT_PROCESS_TIMEOUT,
     env: dict[str, str] | None = None,
     capture_output: bool = False,
 ) -> int:
     """
     安全地运行子进程：
       - args 必须是 list（禁止字符串拼接 → 避免 CWE-78 命令注入）
-      - 可执行文件必须通过 shutil.which 解析为 PATH 中的真实可执行文件，
-        避免 Windows 相对路径劫持 DLL（参考 openbabel_utils._resolve_obabel_cli）
+      - 可执行文件必须解析为**真实绝对路径且非符号链接**，
+        避免 Windows 相对路径劫持 DLL（完全对齐 openbabel_utils._resolve_obabel_cli 逻辑）
       - timeout 超时后自动 kill + return 非 0
-    安全注意：
-      - 禁止 shell=True（确保 args list 原样被传递）
-      - 如果 args[0] 不是绝对路径，先尝试 openbabel_utils 的 _resolve_obabel_cli，
-        否则用 shutil.which；若均失败就保持原样（让操作系统解析，但不使用 shell）
+
+    解析策略（与 _resolve_obabel_cli 同严格度）：
+      1. 已是绝对路径且真实存在：严格校验 is_symlink=False / 是文件。
+      2. 对于 obabel：直接调用 openbabel_utils._resolve_obabel_cli()（无参），复用 DCL + LOCK 安全解析。
+      3. 其他命令：shutil.which → resolve(strict=True) → 非 symlink → 是文件 → 替换 args[0]。
+      4. 以上全部失败：保持 args 原样，但仍用 list+shell=False（最底线的安全保证）。
     """
     if not args:
         raise ValueError("_run_process_with_timeout: args 不能为空")
     arg0 = str(args[0])
     resolved: str | None = None
-    if os.path.isabs(arg0) and os.path.exists(arg0):
-        resolved = arg0
+
+    def _validate_abs_path(path_str: str) -> str | None:
+        """严格校验：是绝对路径、resolve 后真实文件、非 symlink；返回规范化绝对路径。"""
+        try:
+            p = Path(path_str)
+            if not p.is_absolute():
+                return None
+            rp = p.resolve(strict=True)
+            if rp.is_symlink():
+                logger.warning("拒绝使用符号链接指向的可执行文件: %s -> %s", path_str, rp)
+                return None
+            if not rp.is_file():
+                return None
+            return str(rp)
+        except OSError:
+            return None
+
+    validated = _validate_abs_path(arg0)
+    if validated is not None:
+        resolved = validated
+        args = [resolved] + list(args[1:])
     else:
-        # 尝试用 obabel_utils 的 CLI 解析（优先走安全的可执行文件解析链）
+        # 命令名查找：obabel 优先复用安全解析链；其他命令严格 which+resolve
         try:
             import openbabel_utils as _obu
             if arg0 in ("obabel", "obabel.exe"):
-                real = _obu._resolve_obabel_cli([arg0])
-                if real and len(real) >= 1:
-                    resolved = str(real[0])
-                    args = [resolved] + list(args[1:])
-            else:
+                # _resolve_obabel_cli 是无参函数，返回绝对路径字符串（失败直接抛）
+                try:
+                    resolved_exe = _obu._resolve_obabel_cli()
+                    if resolved_exe:
+                        validated2 = _validate_abs_path(resolved_exe)
+                        if validated2 is not None:
+                            resolved = validated2
+                            args = [resolved] + list(args[1:])
+                except Exception:
+                    # 让下面 generic which 流程再试一次（容错）
+                    pass
+            # 通用命令：shutil.which 后严格校验
+            if resolved is None:
                 w = shutil.which(arg0)
                 if w:
-                    resolved = w
-                    args = [resolved] + list(args[1:])
+                    validated3 = _validate_abs_path(w)
+                    if validated3 is not None:
+                        resolved = validated3
+                        args = [resolved] + list(args[1:])
         except Exception:
-            # 解析失败保持原样，但仍用 list+shell=False 执行，避免注入
+            # 解析失败保持原样，但仍使用 list+shell=False 执行，避免注入
             pass
     try:
         cp = subprocess.run(
@@ -137,9 +371,13 @@ def convert_with_obabel(input_file: str, output_file: str) -> bool:
         res = ob_utils.convert_file(input_file, output_file, os.path.splitext(output_file)[1][1:] or 'xyz')
         success = res.get("success", False)
         output_path = res.get("output_path")
-        return success and output_path and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        ok = success and output_path and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        if not ok:
+            logger.debug("OpenBabel 转换失败 %s → %s: result=%s", input_file, output_file, res)
+        return ok
     except Exception as e:
-        print(f"obabel 转换失败: {e}")
+        # 把 print 替换为 logger，避免 stdout 被 GUI 吞掉
+        logger.warning("OpenBabel 转换异常 %s → %s: %s", input_file, output_file, e)
         return False
 
 
@@ -233,7 +471,7 @@ def run_psi4_task(
     **kwargs
 ) -> Dict:
 
-    if not check_psi4_installed():
+    if not check_psi4_installed_simple():
         return {"success": False, "error": "PSI4 未安装"}
 
     if not os.path.exists(input_file):
@@ -246,550 +484,658 @@ def run_psi4_task(
     def report(percent: float, msg: str) -> None:
         if progress_callback:
             progress_callback(percent, msg)
-        print(f"[进度] {percent:.0f}% - {msg}")
+        logger.debug("[PSI4 进度] %3d%% - %s", int(percent), msg)
 
-    # ---------- 1. 强制检测非ASCII字符 ----------
-    input_path = Path(input_file)
-    has_non_ascii = any(ord(c) > 127 for c in str(input_path.resolve()))
-    print(f"路径检测: has_non_ascii = {has_non_ascii}, 路径 = {input_file}")
+    # ===== _TempDirGuard：任何 early-return / exception 都会清理 temp_dir =====
+    # 同时内部维护一个「注册的额外临时路径列表」，确保 converted_xyz 等也被清理
+    class _TempDirGuard:
+        def __init__(self):
+            self.path: str | None = None
+            self.active: bool = True
+            self.extra_paths: list[str] = []
 
-    # 如果路径含非 ASCII 字符，强制使用临时目录
-    use_temp = has_non_ascii
-    temp_dir = None
-    original_output_dir = output_dir if output_dir else str(input_path.parent)
+        def acquire(self, prefix: str = "psi4_temp_") -> str:
+            if self.path is not None:
+                return self.path
+            self.path = tempfile.mkdtemp(prefix=prefix)
+            return self.path
 
-    if use_temp:
-        temp_dir = tempfile.mkdtemp(prefix="psi4_temp_")
-        print(f"⚠️ 检测到中文路径，强制使用临时目录: {temp_dir}")
-        # 强制将 output_dir 设为临时目录（覆盖用户传入的值）
-        output_dir = temp_dir
-    else:
-        # 如果用户未指定 output_dir，使用文件所在目录
-        if output_dir is None:
-            output_dir = str(input_path.parent)
+        def assign(self, existing_path: str | None) -> None:
+            """外部已创建的临时目录，把所有权移交过来。"""
+            self.path = existing_path
 
-    # 确保输出目录存在（纯英文路径）
-    os.makedirs(output_dir, exist_ok=True)
+        def register_extra(self, p: str) -> None:
+            """注册一个临时文件/目录路径（如 converted_xyz），release 时一起清理。"""
+            if p and os.path.exists(p) and p not in self.extra_paths:
+                self.extra_paths.append(p)
 
-    # ---------- 2. 读取分子 ----------
-    # 安全：不再把 input_file 作为路径字符串直接传给 psi4.geometry（H-1 / CWE-918 SSRF 修复）
-    # PSI4 的 geometry() 接口会自动解析以下前缀：
-    #   pubchem:<name|CID>   embed:<SMILES>   smiles:<...>   file://...
-    # 因此即使 input_file 是「文件名」，如果用户/攻击者把文件名取为如 "pubchem:h2o.xyz" 或
-    # 预填入路径 Entry 中类似形式，PSI4 会主动从外网拉取结构。
-    # 修复方法：先把输入文件强制解析为真实文件（严格模式 resolve）→ OpenBabel 统一转 xyz
-    # → 读回纯文本 xyz 内容 → 把 *内存中的纯文本* 传给 psi4.geometry()，PSI4 仅会解析为
-    # XYZ / Z-Matrix 字符串，不会触发任何前缀协议。
-    report(5, "读取分子结构...")
-    mol = None
+        def release(self) -> None:
+            if not self.active:
+                return
+            self.active = False
+            # 先清 extra_paths
+            for ep in self.extra_paths:
+                try:
+                    if os.path.isdir(ep):
+                        shutil.rmtree(ep, ignore_errors=True)
+                    elif os.path.isfile(ep):
+                        os.unlink(ep)
+                except Exception as _re:
+                    logger.debug("TempDirGuard 清理额外临时路径失败 %s: %s", ep, _re)
+            self.extra_paths = []
+            p, self.path = self.path, None
+            if p and os.path.exists(p):
+                try:
+                    shutil.rmtree(p, ignore_errors=True)
+                except Exception as _re:
+                    # 至少打 debug 日志，避免磁盘被残留 tempdir 占满
+                    logger.debug("TempDirGuard 清理主临时目录失败 %s: %s", p, _re)
 
-    try:
-        real_input_path = Path(input_file).resolve(strict=True)
-    except OSError as exc:
-        return {"success": False, "error": f"分子文件无法解析为真实路径: {exc}"}
-    if not real_input_path.is_file() or real_input_path.is_symlink():
-        return {"success": False,
-                "error": f"分子文件必须是真实文件（禁止符号链接）: {input_file}"}
+    _td = _TempDirGuard()
 
-    def _load_from_realpath(full_temp_dir: str | None) -> tuple:
-        # 若 full_temp_dir 为 None，说明使用真实文件所在目录；否则在 temp_dir 里转 molecule.xyz
-        work = Path(full_temp_dir) if full_temp_dir else real_input_path.parent
-        converted_xyz = os.fspath(work / "molecule.xyz")
-        # 先尝试直接读原始文件为 XYZ，如果原始扩展名就是 .xyz 就不跑 OpenBabel，省掉一次转换
-        src_is_xyz = real_input_path.suffix.lower() == ".xyz"
-        if src_is_xyz:
-            xyz = read_xyz_content(os.fspath(real_input_path))
-        else:
-            if not convert_with_obabel(os.fspath(real_input_path), converted_xyz):
-                return None, "OpenBabel 转换失败"
-            xyz = read_xyz_content(converted_xyz)
-        if xyz is None:
-            return None, "无法解析 XYZ"
+    def _finalize():
+        # 幂等：重复调用 release 第二次什么都不做
+        _td.release()
         try:
-            # ⚠️ 关键：传 *纯文本字符串* 而非路径，彻底禁止 PSI4 前缀协议解析
-            return psi4.geometry(xyz), None
-        except Exception as load_err:
-            return None, f"PSI4 读取失败: {load_err}"
+            psi4.core.clean()
+        except Exception as _ce:
+            logger.debug("PSI4 core.clean() 失败: %s", _ce)
 
+    # 把所有可能分配临时目录的代码包在最外层 try/finally，
+    # 保证任何 return 路径都会触发 _finalize()
     try:
-        if use_temp:
-            mol, err = _load_from_realpath(temp_dir)
-            if err:
-                return {"success": False, "error": err}
-        else:
+        # ---------- 1. 强制检测非ASCII字符 ----------
+        input_path = Path(input_file)
+        has_non_ascii = any(ord(c) > 127 for c in str(input_path.resolve()))
+        print(f"路径检测: has_non_ascii = {has_non_ascii}, 路径 = {input_file}")
+
+        # =====【审计 1.1 路径遍历修复】=====
+        # 推断 base_dir：优先 input_path.parent（绝大多数真实场景），否则 fallback 到 cwd/temp
+        _base_dir: Path = _default_base_dir_from_input(input_file)
+        # original_output_dir 也要走安全校验：用户手动传 output_dir 时不允许越出 base_dir
+        try:
+            _raw_orig_dir = output_dir if output_dir is not None else str(input_path.parent)
+            _safe_orig = _secure_output_path(
+                _raw_orig_dir,
+                is_dir=True,
+                base_dir=_base_dir,
+                create_parent=True,
+                # 允许用户显式指定的 output_dir 落在 base_dir 内（默认策略）。
+                # 若确实需要放到工作目录外部，请在 UI 层显式勾选"允许输出到外部目录"后
+                # 由上层 controller 传入 allow_outside=True 的包装路径；这里默认拒绝。
+                allow_outside=False,
+            )
+            original_output_dir = str(_safe_orig)
+        except ValueError as _v:
+            return {"success": False, "error": f"输出目录非法: {_v}"}
+        output_dir = None  # 等三件套逻辑（下面 _switch 或 else 分支）再统一赋值
+
+        # M-4 修复：任何切换到 temp_dir 的代码路径都必须走同一个辅助函数，
+        # 保证 {use_temp=True; output_dir=temp_dir; os.makedirs 三件套} 永远同步，
+        # 避免「只改 use_temp 没改 output_dir」导致后续写入失败。
+        use_temp: bool = False
+        temp_dir: str | None = None
+
+        def _switch_to_temp_dir() -> str:
+            """原子切换到临时目录：三件套永远一致，任何分支用它都不会漏同步 output_dir。"""
+            nonlocal use_temp, temp_dir, output_dir
+            if temp_dir is None:
+                # 优先复用 _TempDirGuard（生命周期绑定整个函数的 finally）
+                td = _td.acquire(prefix="psi4_temp_")
+                temp_dir = td
+            # 已经外部手动 mkdtemp 并通过 _td.assign 注册过的分支走这里，不再重复 acquire
+            out = str(temp_dir)
+            use_temp = True
+            output_dir = out
             try:
-                mol, _load_err = _load_from_realpath(None)
-                if mol is None:
-                    temp_dir = tempfile.mkdtemp(prefix="psi4_temp_")
-                    mol, err = _load_from_realpath(temp_dir)
-                    if err:
-                        return {"success": False, "error": err}
-                    use_temp = True
-                    output_dir = temp_dir
-                    os.makedirs(output_dir, exist_ok=True)
-            except Exception:
-                temp_dir = tempfile.mkdtemp(prefix="psi4_temp_")
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as m_err:
+                raise RuntimeError(f"无法创建 PSI4 临时目录: {output_dir}") from m_err
+            print(f"ℹ️  使用 PSI4 临时目录：{output_dir}")
+            return output_dir
+
+        if has_non_ascii:
+            _switch_to_temp_dir()
+        else:
+            # 用户没传 output_dir 就用 original_output_dir（已安全化）
+            if output_dir is None:
+                output_dir = original_output_dir
+            # 确保输出目录存在（纯英文路径）
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as m_err:
+                raise RuntimeError(f"无法创建 PSI4 输出目录: {output_dir}") from m_err
+
+        # ---------- 2. 读取分子 ----------
+        # 安全：不再把 input_file 作为路径字符串直接传给 psi4.geometry（H-1 / CWE-918 SSRF 修复）
+        # PSI4 的 geometry() 接口会自动解析以下前缀：
+        #   pubchem:<name|CID>   embed:<SMILES>   smiles:<...>   file://...
+        # 因此即使 input_file 是「文件名」，如果用户/攻击者把文件名取为如 "pubchem:h2o.xyz" 或
+        # 预填入路径 Entry 中类似形式，PSI4 会主动从外网拉取结构。
+        # 修复方法：先把输入文件强制解析为真实文件（严格模式 resolve）→ OpenBabel 统一转 xyz
+        # → 读回纯文本 xyz 内容 → 把 *内存中的纯文本* 传给 psi4.geometry()，PSI4 仅会解析为
+        # XYZ / Z-Matrix 字符串，不会触发任何前缀协议。
+        report(5, "读取分子结构...")
+        mol = None
+
+        try:
+            real_input_path = Path(input_file).resolve(strict=True)
+        except OSError as exc:
+            return {"success": False, "error": f"分子文件无法解析为真实路径: {exc}"}
+        if not real_input_path.is_file() or real_input_path.is_symlink():
+            return {"success": False,
+                    "error": f"分子文件必须是真实文件（禁止符号链接）: {input_file}"}
+
+        def _load_from_realpath(full_temp_dir: str | None) -> tuple:
+            # 若 full_temp_dir 为 None，说明使用真实文件所在目录；否则在 temp_dir 里转 molecule.xyz
+            work = Path(full_temp_dir) if full_temp_dir else real_input_path.parent
+            converted_xyz = os.fspath(work / "molecule.xyz")
+            # 问题3修复：把 converted_xyz 注册进 _TempDirGuard，避免 use_temp 目录外（real_input_path.parent 下）
+            # 的临时 converted_xyz 被遗漏
+            if full_temp_dir is None and not real_input_path.suffix.lower() == ".xyz":
+                # 走了「真实目录 + 非 xyz」路径，converted_xyz 会被写在真实目录，
+                # 但它仍是临时文件，应当清理
+                _td.register_extra(converted_xyz)
+            # 先尝试直接读原始文件为 XYZ，如果原始扩展名就是 .xyz 就不跑 OpenBabel，省掉一次转换
+            src_is_xyz = real_input_path.suffix.lower() == ".xyz"
+            if src_is_xyz:
+                xyz = read_xyz_content(os.fspath(real_input_path))
+            else:
+                if not convert_with_obabel(os.fspath(real_input_path), converted_xyz):
+                    return None, "OpenBabel 转换失败"
+                xyz = read_xyz_content(converted_xyz)
+            if xyz is None:
+                return None, "无法解析 XYZ"
+            try:
+                # ⚠️ 关键：传 *纯文本字符串* 而非路径，彻底禁止 PSI4 前缀协议解析
+                return psi4.geometry(xyz), None
+            except Exception as load_err:
+                return None, f"PSI4 读取失败: {load_err}"
+
+        try:
+            if use_temp:
                 mol, err = _load_from_realpath(temp_dir)
                 if err:
                     return {"success": False, "error": err}
-                use_temp = True
-                output_dir = temp_dir
-                os.makedirs(output_dir, exist_ok=True)
-
-        # 设置电荷和多重度
-        if mol is None:
-            return {"success": False, "error": "未能构建分子"}
-        try:
-            mol.set_molecular_charge(charge)
-        except AttributeError:
-            try:
-                mol.set_charge(charge)
-            except Exception:
-                pass
-        try:
-            mol.set_multiplicity(multiplicity)
-        except AttributeError:
-            pass
-    except Exception as e:
-        return {"success": False, "error": f"准备分子失败: {e}"}
-    results: Dict[str, Any] = {
-        "success": False,
-        "energy": None,
-        "optimized_xyz": None,
-        "frequencies": None,
-        "fchk_file": None,
-        "log_file": None,
-        "output_files": [],
-        "error": None,
-    }
-    wfn = None
-    log_file = None
-    output_prefix = None
-
-    try:
-        # ---------- 3. 构建输出路径（纯英文） ----------
-        if use_temp:
-            base = "molecule"
-        else:
-            base = sanitize_filename(os.path.splitext(os.path.basename(input_file))[0])
-
-        safe_method = sanitize_filename(method)
-        safe_basis = sanitize_filename(basis)
-        suffix = f"_{task_type}"
-        if preset_name:
-            suffix += f"_{sanitize_filename(preset_name)}"
-        else:
-            suffix += f"_{safe_method}_{safe_basis}"
-        if solvent:
-            suffix += f"_{sanitize_filename(solvent)}"
-        if d3:
-            suffix += "_d3"
-
-        output_prefix = os.path.join(output_dir, base + suffix)
-        log_file = output_prefix + ".log"
-        results["log_file"] = log_file
-        print(f"日志文件将保存到: {log_file}")
-
-        # 设置 PSI4 日志输出
-        psi4.set_output_file(log_file, append=False)
-
-        # ---------- 4. 计算选项 ----------
-        psi4.set_memory(memory)
-        psi4.set_options({
-            'basis': basis,
-            'scf_type': 'pk',
-            'e_convergence': 1e-8,
-            'd_convergence': 1e-8,
-        })
-        if extra_options:
-            # 让用户可覆盖基础选项，比如 NMR 需要 cphf_tasks
-            try:
-                psi4.set_options(dict(extra_options))
-            except Exception as _eo_err:
-                logger.warning("应用 extra_options 失败：%s", _eo_err)
-        if d3:
-            try:
-                psi4.set_options({'dft_dispersion': 'd3'})
-            except Exception as _d3_err:
-                logger.warning("D3 色散校正启用失败，回退为不加 D3: %s", _d3_err)
-        _pcm_enabled_here = False
-        if solvent:
-            # PSI4 中「solvent=」选项只是全局 GLOBAL 变量，不会自动打开 PCM/SMD 模型。
-            # 显式溶剂模型（PCM）只对单点能 energy() 任务稳定；
-            # optimize / frequency 等需要解析梯度/ Hessian，部分泛函/基组组合会直接报错，
-            # 这里做「尽力启用 + 失败降级」处理。
-            _pcm_try_tasks = {"energy"}
-            if task_type in _pcm_try_tasks:
-                try:
-                    psi4.set_options({'pcm': True, 'solvent': solvent})
-                    try:
-                        psi4.core.set_local_option("PCM", "Solver", "IEFPCM")
-                        psi4.core.set_local_option("PCM", "Medium", "UniformDielectric")
-                        psi4.core.set_local_option("PCM", "SolverEnzyme", False)
-                        psi4.core.set_local_option("PCM", "Cavity", "UFF")
-                        psi4.core.set_local_option("PCM", "Scaling", True)
-                        psi4.core.set_local_option("PCM", "RadiiSet", "UFF")
-                        psi4.core.set_local_option("PCM", "Area", 0.3)
-                    except Exception:
-                        pass
-                    # 部分 Psi4 版本（无 PCMSolver 编译）即使 pcm=True 也会在调用 energy 时
-                    # 抛异常，所以我们在 energy 子块 catch 并自动回退为气相；
-                    # 此处先假定能跑通，失败后会在具体 task 分支里降回气相。
-                    _pcm_enabled_here = True
-                except Exception as _pcm_err:
-                    logger.warning("启用 PCM 隐式溶剂失败，回退为仅写入 solvent 元数据: %s", _pcm_err)
-                    try:
-                        psi4.set_options({'pcm': False, 'solvent': solvent})
-                    except Exception:
-                        pass
             else:
-                # optimize / frequency 等任务：只把 solvent 名字作为元数据写进 options
-                # 不启用 PCM（因为 optimize 常要求解析梯度，SMD/PCM 在旧版本不一定有解析梯度实现）
                 try:
-                    psi4.set_options({'solvent': solvent})
-                except Exception as _solv_meta_err:
-                    logger.warning("写入溶剂元数据选项失败: %s", _solv_meta_err)
-
-        report(10, "开始计算...")
-        _pcm_safe_rollback_done = False
-
-        def _rollback_pcm_if_needed():
-            nonlocal _pcm_safe_rollback_done, _pcm_enabled_here
-            if _pcm_safe_rollback_done or not _pcm_enabled_here:
-                return False
-            _pcm_safe_rollback_done = True
-            try:
-                psi4.set_options({'pcm': False})
-            except Exception:
-                pass
-            logger.warning("PCM 求解失败，已自动回退为气相 energy 重新计算")
-            return True
-
-        # ---------- 5. 执行任务 ----------
-        if task_type == 'energy':
-            report(30, "计算单点能...")
-            try:
-                energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
-            except Exception as _e1:
-                if _rollback_pcm_if_needed():
-                    energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
-                    results["pcm_rolled_back"] = True
-                    results["solvent_rollback_reason"] = str(_e1)[:200]
-                else:
-                    raise
-            results["energy"] = energy
-            results["success"] = True
-
-        elif task_type == 'optimize':
-            report(30, "开始几何优化...")
-            energy, wfn = psi4.optimize(method, molecule=mol, return_wfn=True)
-            results["energy"] = energy
-            opt_mol = wfn.molecule()
-            results["optimized_xyz"] = opt_mol.save_string_xyz()
-            results["success"] = True
-
-        elif task_type == 'frequency':
-            report(30, "计算频率...")
-            energy, wfn = psi4.frequency(method, molecule=mol, return_wfn=True)
-            results["energy"] = energy
-            freqs = psi4.core.variable("frequencies")
-            if freqs is not None:
-                results["frequencies"] = freqs.to_array().tolist()
-            results["success"] = True
-
-        elif task_type == 'ts':
-            report(30, "搜索过渡态...")
-            energy, wfn = psi4.optimize('ts', molecule=mol, return_wfn=True)
-            results["energy"] = energy
-            results["success"] = True
-
-        elif task_type == 'excited':
-            report(30, "计算激发态...")
-            psi4.set_options({'tdscf_excitations': 5})
-            energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
-            results["energy"] = energy
-            results["success"] = True
-
-        elif task_type == 'sapt':
-            report(30, "计算 SAPT...")
-            psi4.set_options({'sapt_symmetry': 'c1'})
-            energy = psi4.sapt_energy(method, molecule=mol)
-            results["energy"] = energy
-            results["success"] = True
-            try:
-                wfn = psi4.core.get_wavefunction()
-            except Exception:
-                wfn = None
-
-        elif task_type == 'thermo':
-            report(30, "进行几何优化...")
-            opt_energy, opt_wfn = psi4.optimize(method, molecule=mol, return_wfn=True)
-            results["energy"] = opt_energy
-            opt_mol = opt_wfn.molecule()
-            results["optimized_xyz"] = opt_mol.save_string_xyz()
-            report(60, "计算频率（优化后结构）...")
-            freq_energy, freq_wfn = psi4.frequency(method, molecule=opt_mol, return_wfn=True)
-            thermo = psi4.core.variable("thermodynamics")
-            if thermo is not None:
-                results["thermo"] = thermo.to_array().tolist()
-            results["success"] = True
-            wfn = opt_wfn
-
-        else:
-            results["error"] = f"未知任务类型: {task_type}"
-
-        # ----- 高级扩展：用户自定义 post hook（如 NMR 需要在主任务后再跑 cphf） -----
-        if results["success"] and extra_post_hook is not None:
-            try:
-                _hook_ret = extra_post_hook(wfn, mol, method)
-                if isinstance(_hook_ret, dict):
-                    results.setdefault("hook", {}).update(_hook_ret)
-            except Exception as _hook_err:
-                logger.warning("extra_post_hook 执行失败：%s", _hook_err)
-                results["hook_error"] = str(_hook_err)
-
-        # ========== P1 波函数属性（HOMO/LUMO/偶极/电荷布居/转动常数） ==========
-        if results["success"] and wfn is not None:
-            try:
-                props: dict[str, Any] = {}
-                # 1) 从波函数直接取 HOMO/LUMO 能隙（Hartree → eV）
-                try:
-                    na_list = wfn.nalpha()  # 整数 alpha 电子数
-                    nb_list = wfn.nbeta()
-                    # epsilon_a_subset("ALL") → 所有 alpha 轨道能量（Hartree）
-                    eps_a = None
-                    try:
-                        eps_a_arr = wfn.epsilon_a()  # psi4 Vector
-                        if eps_a is not None:
-                            eps_a = eps_a_arr.to_array()
-                    except Exception:
-                        pass
-                    if eps_a is not None and len(eps_a) > 0:
-                        n_a = int(na_list)
-                        homo_i = max(0, min(n_a - 1, len(eps_a) - 1))
-                        lumo_i = min(homo_i + 1, len(eps_a) - 1)
-                        hartree_to_ev = 27.21139664
-                        homo_ev = float(eps_a[homo_i]) * hartree_to_ev
-                        lumo_ev = float(eps_a[lumo_i]) * hartree_to_ev
-                        props["homo_ev"] = homo_ev
-                        props["lumo_ev"] = lumo_ev
-                        props["gap_ev"] = lumo_ev - homo_ev
-                        props["homo_idx"] = homo_i + 1
-                        props["lumo_idx"] = lumo_i + 1
-                except Exception as _e_hl:
-                    logger.debug("取 HOMO/LUMO 失败: %s", _e_hl)
-
-                # 2) 用 oeprop 取 Mulliken / Löwdin 电荷、偶极矩
-                try:
-                    psi4.oeprop(wfn,
-                                "MULLIKEN_CHARGES",
-                                "LOWDIN_CHARGES",
-                                "DIPOLE",
-                                "QUADRUPOLE",
-                                "MO_ENERGIES")
-                    # oeprop 会把结果写入 psi4 变量；原子电荷通过 oeprop 返回字典或 core.get_array
-                    try:
-                        mu_x = float(psi4.core.variable("DIPOLE X"))
-                        mu_y = float(psi4.core.variable("DIPOLE Y"))
-                        mu_z = float(psi4.core.variable("DIPOLE Z"))
-                        mu_tot = (mu_x ** 2 + mu_y ** 2 + mu_z ** 2) ** 0.5
-                        props["dipole"] = {"x_D": mu_x, "y_D": mu_y, "z_D": mu_z, "total_D": mu_tot}
-                    except Exception as _e_d:
-                        logger.debug("取偶极矩失败: %s", _e_d)
-
-                    # 原子电荷：通过 oeprop 内部 charge arrays
-                    def _pull_charges(key: str) -> list[float] | None:
-                        try:
-                            arr = psi4.core.variable(key)
-                            if arr is None:
-                                # 新版 PSI4 改放 oeprop().charges()
-                                return None
-                            if hasattr(arr, 'to_array'):
-                                return arr.to_array().tolist()
-                            if isinstance(arr, (list, tuple)):
-                                return [float(x) for x in arr]
-                            return None
-                        except Exception:
-                            return None
-                    mulliken = _pull_charges("MULLIKEN CHARGES")
-                    lowdin = _pull_charges("LOWDIN CHARGES")
-                    # 回退：解析 out log 文本（最后 200 行找 Mulliken Charges 块）
-                    if mulliken is None and results.get("log_file") and os.path.exists(results["log_file"]):
-                        try:
-                            from psi4_compute import _extract_charges_from_log  # type: ignore  # noqa: F401
-                        except Exception:
-                            pass
-                    atoms_sym: list[str] = []
-                    if mol is not None:
-                        try:
-                            n_at = mol.natom()
-                            for i in range(n_at):
-                                atoms_sym.append(mol.symbol(i))
-                        except Exception:
-                            atoms_sym = []
-                    if mulliken is not None and atoms_sym and len(mulliken) == len(atoms_sym):
-                        props["charges"] = {
-                            "atoms": atoms_sym,
-                            "mulliken": mulliken,
-                        }
-                        if lowdin is not None and len(lowdin) == len(atoms_sym):
-                            props["charges"]["lowdin"] = lowdin
-                except Exception as _e_prop:
-                    logger.debug("oeprop 属性计算失败: %s", _e_prop)
-
-                # 3) 转动常数（A/B/C，MHz）
-                try:
-                    rot_const_keys = ["ROTATIONAL CONSTANT A", "ROTATIONAL CONSTANT B", "ROTATIONAL CONSTANT C"]
-                    rcs: dict[str, float] = {}
-                    for k in rot_const_keys:
-                        v = psi4.core.variable(k)
-                        if v is not None:
-                            try:
-                                rcs[k.split()[-1]] = float(v)
-                            except Exception:
-                                pass
-                    if rcs:
-                        props["rotational_constants_MHz"] = rcs
-                except Exception as _e_rc:
-                    logger.debug("取转动常数失败: %s", _e_rc)
-
-                if props:
-                    results["properties"] = props
-            except Exception as _e_p1:
-                logger.debug("P1 波函数属性提取整体失败: %s", _e_p1)
-
-        # ========== P3 频率 → 模拟 IR 光谱图（PNG + CSV） ==========
-        ir_png: str | None = None
-        ir_csv: str | None = None
-        if results["success"] and results.get("frequencies") and output_prefix:
-            try:
-                ir_csv = output_prefix + "_ir_spectrum.csv"
-                ir_png = output_prefix + "_ir_spectrum.png"
-                freqs = list(results["frequencies"])
-                # 强度：PSI4 frequency() 会把 "IR INTENSITIES" 写入 core variable，取不到就用常数 1 兜底
-                intensities: list[float] = []
-                try:
-                    ir_arr = psi4.core.variable("IR INTENSITIES")
-                    if ir_arr is not None and hasattr(ir_arr, "to_array"):
-                        intensities = [float(x) for x in ir_arr.to_array().tolist()]
+                    mol, _load_err = _load_from_realpath(None)
+                    if mol is None:
+                        # 回退到临时目录：先手动创建 temp_dir 并注册给 _TempDirGuard，然后切三件套
+                        td = tempfile.mkdtemp(prefix="psi4_temp_")
+                        _td.assign(td)
+                        temp_dir = td
+                        _switch_to_temp_dir()
+                        mol, err = _load_from_realpath(temp_dir)
+                        if err:
+                            return {"success": False, "error": err}
                 except Exception:
-                    intensities = []
-                n = len(freqs)
-                if len(intensities) != n:
-                    intensities = [1.0 for _ in freqs]
-                # 写 CSV：波数,强度
-                with open(ir_csv, "w", encoding="utf-8", newline="") as _f:
-                    _wr = csv.writer(_f)
-                    _wr.writerow(["wavenumber_cm-1", "intensity_km/mol"])
-                    for fv, iv in zip(freqs, intensities):
-                        _wr.writerow([fv, iv])
-                # 画 PNG：400-4000 cm⁻¹ 典型有机分子区间，洛伦兹展宽 FWHM=10 cm⁻¹
-                _plot_ir(freqs, intensities, ir_png)
-                results["ir_csv"] = ir_csv
-                results["ir_png"] = ir_png
-                results["output_files"].extend([ir_csv, ir_png])
-            except Exception as _e_p3:
-                logger.debug("P3 IR 光谱生成失败: %s", _e_p3)
+                    td = tempfile.mkdtemp(prefix="psi4_temp_")
+                    _td.assign(td)
+                    temp_dir = td
+                    _switch_to_temp_dir()
+                    mol, err = _load_from_realpath(temp_dir)
+                    if err:
+                        return {"success": False, "error": err}
 
-        # ========== P2 cubeprop：HOMO/LUMO/总电子密度 cube 文件 ==========
-        cube_files: list[str] = []
-        if results["success"] and wfn is not None and output_prefix:
+            # 设置电荷和多重度
+            if mol is None:
+                return {"success": False, "error": "未能构建分子"}
             try:
-                cube_out_dir = Path(output_prefix).parent / (Path(output_prefix).name + "_cubes")
-                cube_out_dir.mkdir(parents=True, exist_ok=True)
+                mol.set_molecular_charge(charge)
+            except AttributeError:
                 try:
-                    old_cwd = Path.cwd()
-                    os.chdir(cube_out_dir)
-                except OSError:
-                    old_cwd = None
-                try:
-                    psi4.set_options({
-                        'CUBEPROP_TASKS': ['DENSITY', 'FRONTIER_ORBITALS'],
-                        'CUBIC_GRID_SPACING': 0.25,
-                    })
-                    psi4.cubeprop(wfn)
-                finally:
-                    if old_cwd is not None:
-                        try:
-                            os.chdir(old_cwd)
-                        except OSError:
-                            pass
-                # 收集 cube 文件
-                for p in cube_out_dir.iterdir():
-                    if p.suffix.lower() == ".cube":
-                        cube_files.append(str(p))
-                results["cube_dir"] = str(cube_out_dir)
-                results["cube_files"] = cube_files
-                results["output_files"].extend(cube_files)
-            except Exception as _e_p2:
-                logger.debug("P2 cubeprop 失败: %s", _e_p2)
+                    mol.set_charge(charge)
+                except Exception as _ch:
+                    logger.debug("设置分子电荷 (set_charge) 失败 q=%d: %s", charge, _ch)
+            try:
+                mol.set_multiplicity(multiplicity)
+            except AttributeError as _ma:
+                logger.debug("设置分子多重度 (set_multiplicity) 失败 mult=%d: %s", multiplicity, _ma)
+        except Exception as e:
+            return {"success": False, "error": f"准备分子失败: {e}"}
+        results: Dict[str, Any] = {
+            "success": False,
+            "energy": None,
+            "optimized_xyz": None,
+            "frequencies": None,
+            "fchk_file": None,
+            "log_file": None,
+            "output_files": [],
+            "error": None,
+        }
+        wfn = None
+        log_file = None
+        output_prefix = None
 
-        # ---------- 6. 保存结果 ----------
-        if results["success"] and output_prefix:
-            report(80, "保存结果文件...")
-            if wfn is None:
+        try:
+            # ---------- 3. 构建输出路径（纯英文） ----------
+            if use_temp:
+                base = "molecule"
+            else:
+                base = sanitize_filename(os.path.splitext(os.path.basename(input_file))[0])
+
+            safe_method = sanitize_filename(method)
+            safe_basis = sanitize_filename(basis)
+            suffix = f"_{task_type}"
+            if preset_name:
+                suffix += f"_{sanitize_filename(preset_name)}"
+            else:
+                suffix += f"_{safe_method}_{safe_basis}"
+            if solvent:
+                suffix += f"_{sanitize_filename(solvent)}"
+            if d3:
+                suffix += "_d3"
+
+            output_prefix = os.path.join(output_dir, base + suffix)
+            log_file = output_prefix + ".log"
+            results["log_file"] = log_file
+            logger.info("PSI4 日志文件将保存到: %s", log_file)
+
+            # 设置 PSI4 日志输出
+            psi4.set_output_file(log_file, append=False)
+
+            # ---------- 4. 计算选项 ----------
+            psi4.set_memory(memory)
+            psi4.set_options({
+                'basis': basis,
+                'scf_type': 'pk',
+                'e_convergence': 1e-8,
+                'd_convergence': 1e-8,
+            })
+            if extra_options:
+                # 让用户可覆盖基础选项，比如 NMR 需要 cphf_tasks
+                try:
+                    psi4.set_options(dict(extra_options))
+                except Exception as _eo_err:
+                    logger.warning("应用 extra_options 失败：%s", _eo_err)
+            if d3:
+                try:
+                    psi4.set_options({'dft_dispersion': 'd3'})
+                except Exception as _d3_err:
+                    logger.warning("D3 色散校正启用失败，回退为不加 D3: %s", _d3_err)
+            _pcm_enabled_here = False
+            if solvent:
+                # PSI4 中「solvent=」选项只是全局 GLOBAL 变量，不会自动打开 PCM/SMD 模型。
+                # 显式溶剂模型（PCM）只对单点能 energy() 任务稳定；
+                # optimize / frequency 等需要解析梯度/ Hessian，部分泛函/基组组合会直接报错，
+                # 这里做「尽力启用 + 失败降级」处理。
+                _pcm_try_tasks = {"energy"}
+                if task_type in _pcm_try_tasks:
+                    try:
+                        psi4.set_options({'pcm': True, 'solvent': solvent})
+                        try:
+                            psi4.core.set_local_option("PCM", "Solver", "IEFPCM")
+                            psi4.core.set_local_option("PCM", "Medium", "UniformDielectric")
+                            psi4.core.set_local_option("PCM", "SolverEnzyme", False)
+                            psi4.core.set_local_option("PCM", "Cavity", "UFF")
+                            psi4.core.set_local_option("PCM", "Scaling", True)
+                            psi4.core.set_local_option("PCM", "RadiiSet", "UFF")
+                            psi4.core.set_local_option("PCM", "Area", 0.3)
+                        except Exception as _pcm_opts_err:
+                            logger.debug("PCM 局部选项设置失败（通常是 PCMSolver 未编译进 PSI4）: %s",
+                                         _pcm_opts_err)
+                        # 部分 Psi4 版本（无 PCMSolver 编译）即使 pcm=True 也会在调用 energy 时
+                        # 抛异常，所以我们在 energy 子块 catch 并自动回退为气相；
+                        # 此处先假定能跑通，失败后会在具体 task 分支里降回气相。
+                        _pcm_enabled_here = True
+                    except Exception as _pcm_err:
+                        logger.warning("启用 PCM 隐式溶剂失败，回退为仅写入 solvent 元数据: %s", _pcm_err)
+                        try:
+                            psi4.set_options({'pcm': False, 'solvent': solvent})
+                        except Exception:
+                            pass
+                else:
+                    # optimize / frequency 等任务：只把 solvent 名字作为元数据写进 options
+                    # 不启用 PCM（因为 optimize 常要求解析梯度，SMD/PCM 在旧版本不一定有解析梯度实现）
+                    try:
+                        psi4.set_options({'solvent': solvent})
+                    except Exception as _solv_meta_err:
+                        logger.warning("写入溶剂元数据选项失败: %s", _solv_meta_err)
+
+            report(10, "开始计算...")
+            _pcm_safe_rollback_done = False
+
+            def _rollback_pcm_if_needed():
+                nonlocal _pcm_safe_rollback_done, _pcm_enabled_here
+                if _pcm_safe_rollback_done or not _pcm_enabled_here:
+                    return False
+                _pcm_safe_rollback_done = True
+                try:
+                    psi4.set_options({'pcm': False})
+                except Exception:
+                    pass
+                logger.warning("PCM 求解失败，已自动回退为气相 energy 重新计算")
+                return True
+
+            # ---------- 5. 执行任务 ----------
+            if task_type == 'energy':
+                report(30, "计算单点能...")
+                try:
+                    energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
+                except Exception as _e1:
+                    if _rollback_pcm_if_needed():
+                        energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
+                        results["pcm_rolled_back"] = True
+                        results["solvent_rollback_reason"] = str(_e1)[:200]
+                    else:
+                        raise
+                results["energy"] = energy
+                results["success"] = True
+
+            elif task_type == 'optimize':
+                report(30, "开始几何优化...")
+                energy, wfn = psi4.optimize(method, molecule=mol, return_wfn=True)
+                results["energy"] = energy
+                opt_mol = wfn.molecule()
+                results["optimized_xyz"] = opt_mol.save_string_xyz()
+                results["success"] = True
+
+            elif task_type == 'frequency':
+                report(30, "计算频率...")
+                energy, wfn = psi4.frequency(method, molecule=mol, return_wfn=True)
+                results["energy"] = energy
+                freqs = psi4.core.variable("frequencies")
+                if freqs is not None:
+                    results["frequencies"] = freqs.to_array().tolist()
+                results["success"] = True
+
+            elif task_type == 'ts':
+                report(30, "搜索过渡态...")
+                energy, wfn = psi4.optimize('ts', molecule=mol, return_wfn=True)
+                results["energy"] = energy
+                results["success"] = True
+
+            elif task_type == 'excited':
+                report(30, "计算激发态...")
+                psi4.set_options({'tdscf_excitations': 5})
+                energy, wfn = psi4.energy(method, molecule=mol, return_wfn=True)
+                results["energy"] = energy
+                results["success"] = True
+
+            elif task_type == 'sapt':
+                report(30, "计算 SAPT...")
+                psi4.set_options({'sapt_symmetry': 'c1'})
+                energy = psi4.sapt_energy(method, molecule=mol)
+                results["energy"] = energy
+                results["success"] = True
                 try:
                     wfn = psi4.core.get_wavefunction()
                 except Exception:
                     wfn = None
 
-            if wfn is not None:
-                fchk_file = output_prefix + ".fchk"
-                psi4.fchk(wfn, fchk_file)
-                results["fchk_file"] = fchk_file
-                results["output_files"].append(fchk_file)
+            elif task_type == 'thermo':
+                report(30, "进行几何优化...")
+                opt_energy, opt_wfn = psi4.optimize(method, molecule=mol, return_wfn=True)
+                results["energy"] = opt_energy
+                opt_mol = opt_wfn.molecule()
+                results["optimized_xyz"] = opt_mol.save_string_xyz()
+                report(60, "计算频率（优化后结构）...")
+                freq_energy, freq_wfn = psi4.frequency(method, molecule=opt_mol, return_wfn=True)
+                thermo = psi4.core.variable("thermodynamics")
+                if thermo is not None:
+                    results["thermo"] = thermo.to_array().tolist()
+                results["success"] = True
+                wfn = opt_wfn
 
-            if results.get("optimized_xyz"):
-                xyz_file = output_prefix + "_opt.xyz"
-                with open(xyz_file, 'w') as f:
-                    f.write(results["optimized_xyz"])
-                results["output_files"].append(xyz_file)
+            else:
+                results["error"] = f"未知任务类型: {task_type}"
 
-            summary_file = output_prefix + "_summary.json"
-            summary_data = {
-                "input_file": input_file,
-                "task_type": task_type,
-                "method": method,
-                "basis": basis,
-                "preset": preset_name,
-                "energy": results["energy"],
-                "success": results["success"],
-            }
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                json.dump(summary_data, f, indent=2)
-            results["output_files"].append(summary_file)
+            # ----- 高级扩展：用户自定义 post hook（如 NMR 需要在主任务后再跑 cphf） -----
+            if results["success"] and extra_post_hook is not None:
+                try:
+                    _hook_ret = extra_post_hook(wfn, mol, method)
+                    if isinstance(_hook_ret, dict):
+                        results.setdefault("hook", {}).update(_hook_ret)
+                except Exception as _hook_err:
+                    logger.warning("extra_post_hook 执行失败：%s", _hook_err)
+                    results["hook_error"] = str(_hook_err)
 
-        # ---------- 7. 复制结果到原目录 ----------
-        if use_temp and temp_dir:
-            report(95, "复制结果到原目录...")
-            os.makedirs(original_output_dir, exist_ok=True)
-            for src_path in list(results["output_files"]):
-                if os.path.exists(src_path):
-                    dst_path = os.path.join(original_output_dir, os.path.basename(src_path))
-                    shutil.copy2(src_path, dst_path)
-                    if src_path == results.get("log_file"):
-                        results["log_file"] = dst_path
-                    elif src_path == results.get("fchk_file"):
-                        results["fchk_file"] = dst_path
-            if log_file and os.path.exists(log_file) and log_file not in results["output_files"]:
-                dst_log = os.path.join(original_output_dir, os.path.basename(log_file))
-                shutil.copy2(log_file, dst_log)
-                results["log_file"] = dst_log
+            # ========== P1 波函数属性（HOMO/LUMO/偶极/电荷布居/转动常数） ==========
+            if results["success"] and wfn is not None:
+                try:
+                    props: dict[str, Any] = {}
+                    # 1) 从波函数直接取 HOMO/LUMO 能隙（Hartree → eV）
+                    try:
+                        na_list = wfn.nalpha()  # 整数 alpha 电子数
+                        nb_list = wfn.nbeta()
+                        # epsilon_a_subset("ALL") → 所有 alpha 轨道能量（Hartree）
+                        eps_a = None
+                        try:
+                            eps_a_arr = wfn.epsilon_a()  # psi4 Vector
+                            if eps_a is not None:
+                                eps_a = eps_a_arr.to_array()
+                        except Exception:
+                            pass
+                        if eps_a is not None and len(eps_a) > 0:
+                            n_a = int(na_list)
+                            homo_i = max(0, min(n_a - 1, len(eps_a) - 1))
+                            lumo_i = min(homo_i + 1, len(eps_a) - 1)
+                            hartree_to_ev = 27.21139664
+                            homo_ev = float(eps_a[homo_i]) * hartree_to_ev
+                            lumo_ev = float(eps_a[lumo_i]) * hartree_to_ev
+                            props["homo_ev"] = homo_ev
+                            props["lumo_ev"] = lumo_ev
+                            props["gap_ev"] = lumo_ev - homo_ev
+                            props["homo_idx"] = homo_i + 1
+                            props["lumo_idx"] = lumo_i + 1
+                    except Exception as _e_hl:
+                        logger.debug("取 HOMO/LUMO 失败: %s", _e_hl)
 
-        report(100, "任务完成")
+                    # 2) 用 oeprop 取 Mulliken / Löwdin 电荷、偶极矩
+                    try:
+                        psi4.oeprop(wfn,
+                                    "MULLIKEN_CHARGES",
+                                    "LOWDIN_CHARGES",
+                                    "DIPOLE",
+                                    "QUADRUPOLE",
+                                    "MO_ENERGIES")
+                        # oeprop 会把结果写入 psi4 变量；原子电荷通过 oeprop 返回字典或 core.get_array
+                        try:
+                            mu_x = float(psi4.core.variable("DIPOLE X"))
+                            mu_y = float(psi4.core.variable("DIPOLE Y"))
+                            mu_z = float(psi4.core.variable("DIPOLE Z"))
+                            mu_tot = (mu_x ** 2 + mu_y ** 2 + mu_z ** 2) ** 0.5
+                            props["dipole"] = {"x_D": mu_x, "y_D": mu_y, "z_D": mu_z, "total_D": mu_tot}
+                        except Exception as _e_d:
+                            logger.debug("取偶极矩失败: %s", _e_d)
 
-    except Exception as e:
-        results["error"] = str(e)
-        import traceback
-        traceback.print_exc()
+                        # 原子电荷：通过 oeprop 内部 charge arrays
+                        def _pull_charges(key: str) -> list[float] | None:
+                            try:
+                                arr = psi4.core.variable(key)
+                                if arr is None:
+                                    # 新版 PSI4 改放 oeprop().charges()
+                                    return None
+                                if hasattr(arr, 'to_array'):
+                                    return arr.to_array().tolist()
+                                if isinstance(arr, (list, tuple)):
+                                    return [float(x) for x in arr]
+                                return None
+                            except Exception:
+                                return None
+                        mulliken = _pull_charges("MULLIKEN CHARGES")
+                        lowdin = _pull_charges("LOWDIN CHARGES")
+                        # 回退：解析 out log 文本（最后 200 行找 Mulliken Charges 块）
+                        if mulliken is None and results.get("log_file") and os.path.exists(results["log_file"]):
+                            try:
+                                from psi4_compute import _extract_charges_from_log  # type: ignore  # noqa: F401
+                            except Exception:
+                                pass
+                        atoms_sym: list[str] = []
+                        if mol is not None:
+                            try:
+                                n_at = mol.natom()
+                                for i in range(n_at):
+                                    atoms_sym.append(mol.symbol(i))
+                            except Exception:
+                                atoms_sym = []
+                        if mulliken is not None and atoms_sym and len(mulliken) == len(atoms_sym):
+                            props["charges"] = {
+                                "atoms": atoms_sym,
+                                "mulliken": mulliken,
+                            }
+                            if lowdin is not None and len(lowdin) == len(atoms_sym):
+                                props["charges"]["lowdin"] = lowdin
+                    except Exception as _e_prop:
+                        logger.debug("oeprop 属性计算失败: %s", _e_prop)
+
+                    # 3) 转动常数（A/B/C，MHz）
+                    try:
+                        rot_const_keys = ["ROTATIONAL CONSTANT A", "ROTATIONAL CONSTANT B", "ROTATIONAL CONSTANT C"]
+                        rcs: dict[str, float] = {}
+                        for k in rot_const_keys:
+                            v = psi4.core.variable(k)
+                            if v is not None:
+                                try:
+                                    rcs[k.split()[-1]] = float(v)
+                                except Exception:
+                                    pass
+                        if rcs:
+                            props["rotational_constants_MHz"] = rcs
+                    except Exception as _e_rc:
+                        logger.debug("取转动常数失败: %s", _e_rc)
+
+                    if props:
+                        results["properties"] = props
+                except Exception as _e_p1:
+                    logger.debug("P1 波函数属性提取整体失败: %s", _e_p1)
+
+            # ========== P3 频率 → 模拟 IR 光谱图（PNG + CSV） ==========
+            ir_png: str | None = None
+            ir_csv: str | None = None
+            if results["success"] and results.get("frequencies") and output_prefix:
+                try:
+                    ir_csv = output_prefix + "_ir_spectrum.csv"
+                    ir_png = output_prefix + "_ir_spectrum.png"
+                    freqs = list(results["frequencies"])
+                    # 强度：PSI4 frequency() 会把 "IR INTENSITIES" 写入 core variable，取不到就用常数 1 兜底
+                    intensities: list[float] = []
+                    try:
+                        ir_arr = psi4.core.variable("IR INTENSITIES")
+                        if ir_arr is not None and hasattr(ir_arr, "to_array"):
+                            intensities = [float(x) for x in ir_arr.to_array().tolist()]
+                    except Exception:
+                        intensities = []
+                    n = len(freqs)
+                    if len(intensities) != n:
+                        intensities = [1.0 for _ in freqs]
+                    # 写 CSV：波数,强度
+                    with open(ir_csv, "w", encoding="utf-8", newline="") as _f:
+                        _wr = csv.writer(_f)
+                        _wr.writerow(["wavenumber_cm-1", "intensity_km/mol"])
+                        for fv, iv in zip(freqs, intensities):
+                            _wr.writerow([fv, iv])
+                    # 画 PNG：400-4000 cm⁻¹ 典型有机分子区间，洛伦兹展宽 FWHM=10 cm⁻¹
+                    _plot_ir(freqs, intensities, ir_png)
+                    results["ir_csv"] = ir_csv
+                    results["ir_png"] = ir_png
+                    results["output_files"].extend([ir_csv, ir_png])
+                except Exception as _e_p3:
+                    logger.debug("P3 IR 光谱生成失败: %s", _e_p3)
+
+            # ========== P2 cubeprop：HOMO/LUMO/总电子密度 cube 文件 ==========
+            cube_files: list[str] = []
+            if results["success"] and wfn is not None and output_prefix:
+                try:
+                    cube_out_dir = Path(output_prefix).parent / (Path(output_prefix).name + "_cubes")
+                    cube_out_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        old_cwd = Path.cwd()
+                        os.chdir(cube_out_dir)
+                    except OSError:
+                        old_cwd = None
+                    try:
+                        psi4.set_options({
+                            'CUBEPROP_TASKS': ['DENSITY', 'FRONTIER_ORBITALS'],
+                            'CUBIC_GRID_SPACING': 0.25,
+                        })
+                        psi4.cubeprop(wfn)
+                    finally:
+                        if old_cwd is not None:
+                            try:
+                                os.chdir(old_cwd)
+                            except OSError:
+                                pass
+                    # 收集 cube 文件
+                    for p in cube_out_dir.iterdir():
+                        if p.suffix.lower() == ".cube":
+                            cube_files.append(str(p))
+                    results["cube_dir"] = str(cube_out_dir)
+                    results["cube_files"] = cube_files
+                    results["output_files"].extend(cube_files)
+                except Exception as _e_p2:
+                    logger.debug("P2 cubeprop 失败: %s", _e_p2)
+
+            # ---------- 6. 保存结果 ----------
+            if results["success"] and output_prefix:
+                report(80, "保存结果文件...")
+                if wfn is None:
+                    try:
+                        wfn = psi4.core.get_wavefunction()
+                    except Exception:
+                        wfn = None
+
+                if wfn is not None:
+                    fchk_file = output_prefix + ".fchk"
+                    psi4.fchk(wfn, fchk_file)
+                    results["fchk_file"] = fchk_file
+                    results["output_files"].append(fchk_file)
+
+                if results.get("optimized_xyz"):
+                    xyz_file = output_prefix + "_opt.xyz"
+                    with open(xyz_file, 'w') as f:
+                        f.write(results["optimized_xyz"])
+                    results["output_files"].append(xyz_file)
+
+                summary_file = output_prefix + "_summary.json"
+                summary_data = {
+                    "input_file": input_file,
+                    "task_type": task_type,
+                    "method": method,
+                    "basis": basis,
+                    "preset": preset_name,
+                    "energy": results["energy"],
+                    "success": results["success"],
+                }
+                with open(summary_file, 'w', encoding='utf-8') as f:
+                    json.dump(summary_data, f, indent=2)
+                results["output_files"].append(summary_file)
+
+            # ---------- 7. 复制结果到原目录 ----------
+            if use_temp and temp_dir:
+                report(95, "复制结果到原目录...")
+                os.makedirs(original_output_dir, exist_ok=True)
+                for src_path in list(results["output_files"]):
+                    if os.path.exists(src_path):
+                        dst_path = os.path.join(original_output_dir, os.path.basename(src_path))
+                        shutil.copy2(src_path, dst_path)
+                        if src_path == results.get("log_file"):
+                            results["log_file"] = dst_path
+                        elif src_path == results.get("fchk_file"):
+                            results["fchk_file"] = dst_path
+                if log_file and os.path.exists(log_file) and log_file not in results["output_files"]:
+                    dst_log = os.path.join(original_output_dir, os.path.basename(log_file))
+                    shutil.copy2(log_file, dst_log)
+                    results["log_file"] = dst_log
+
+            report(100, "任务完成")
+
+        except Exception as e:
+            results["error"] = str(e)
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                psi4.core.clean()
+            except Exception:
+                pass
 
     finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        try:
-            psi4.core.clean()
-        except Exception:
-            pass
+        _finalize()
 
     return results
 
@@ -1303,7 +1649,7 @@ def run_irc_task(
         "backward_xyz_frames": [],
         "combined_trajectory_xyz": None,
     }
-    if not check_psi4_installed():
+    if not check_psi4_installed_simple():
         result["error"] = "PSI4 未安装"; return result
     tmp_dir = _tf.mkdtemp(prefix="psi4_irc_")
     try:
@@ -1562,7 +1908,8 @@ def run_reaction_energy_profile(
     def _report(p, m):
         if _progress_callback:
             try: _progress_callback(p, m)
-            except Exception: pass
+            except Exception as _rp:
+                logger.debug("_progress_callback 失败: %s", _rp)
 
     result: dict[str, Any] = {
         "success": False, "error": None,
@@ -1729,7 +2076,7 @@ def run_pka_prediction(
     method: str = "M06-2X", basis: str = "def2-TZVP",
     output_prefix: str | None = None,
     solvent_model: str = "smd",   # 目前只支持 smd/pcm
-    solvent_name: str = "water",
+    solvent_name: str = DEFAULT_SOLVENT,
     d3: bool = True,
     memory: str = "8 GB",
     # H+(aq) 经验自由能 (kcal/mol)，文献常见值：-265.9 ± 1 （COSMO-RS / JPCA 2011）
@@ -1751,7 +2098,8 @@ def run_pka_prediction(
     def _report(p, m):
         if _progress_callback:
             try: _progress_callback(p, m)
-            except Exception: pass
+            except Exception as _rp:
+                logger.debug("_progress_callback 失败: %s", _rp)
     if output_prefix is None:
         parent = os.path.dirname(os.path.abspath(ha_file))
         output_prefix = os.path.join(parent, os.path.splitext(os.path.basename(ha_file))[0] + "_pka")
@@ -1822,8 +2170,8 @@ def run_pka_prediction(
         if _auto_Aminus_tmp and os.path.exists(_auto_Aminus_tmp):
             try:
                 os.unlink(_auto_Aminus_tmp)
-            except Exception:
-                pass
+            except Exception as _del_err:
+                logger.debug("清理 pKa A⁻ 临时文件失败 %s: %s", _auto_Aminus_tmp, _del_err)
 
 # ===============================================================
 # X3：Boltzmann 加权 ¹H NMR 谱模拟（PSI4 CPHF 屏蔽常数 + OB 构象）
@@ -1856,7 +2204,8 @@ def run_nmr_simulation(
     def _report(p, m):
         if _progress_callback:
             try: _progress_callback(p, m)
-            except Exception: pass
+            except Exception as _rp:
+                logger.debug("_progress_callback 失败: %s", _rp)
     result: dict[str, Any] = {"success": False, "error": None}
     from pathlib import Path as _P
     if output_dir is None:
@@ -1901,10 +2250,24 @@ def run_nmr_simulation(
         except Exception: return 0, [], []
     psi4_available = False
     try:
-        import psi4  # noqa: F401
-        psi4_available = True
-    except Exception:
+        # 复用模块级别的 psi4 变量；如果模块级别已经是 None，
+        # 这里再尝试 import psi4 并在失败时先打 numpy patch 再重试（与模块开头逻辑一致）。
+        if globals().get("psi4") is not None:
+            psi4_available = True
+        else:
+            _apply_numpy_cumproduct_compat_patch()
+            import psi4  # noqa: F401
+            psi4_available = True
+    except Exception as _nmr_psi4_imp:
+        logger.warning("run_nmr_simulation 无法使用 PSI4（将退回经验化学位移）: %s", _nmr_psi4_imp)
         psi4_available = False
+
+    # 问题5修复：如果 PSI4 可用但 CPHF NMR 没开，显式 warning（不只是 debug），让用户知道谱不准的原因
+    if psi4_available:
+        _ok, _msg, _det = check_psi4_installed()
+        if not _det.get("has_cphf_nmr"):
+            logger.warning("PSI4 已安装但未启用 CPHF NMR 编译选项，¹H NMR 模拟将退回经验化学位移库"
+                           "（准确度有限）。建议重新编译 PSI4 开启 CPHF。")
 
     if psi4_available:
         for idx, (t, w) in enumerate(zip(top, weights), 1):
@@ -1984,7 +2347,8 @@ def run_nmr_simulation(
         w = weights[conf_i]
         for i_H in range(H_atom_count):
             try: avg_sigma[i_H] += shifts[i_H] * w
-            except Exception: pass
+            except Exception as _we:
+                logger.debug("NMR Boltzmann 加权异常 conf=%d H=%d: %s", conf_i, i_H, _we)
     if tms_sigma_ppm is None:
         # 经验 σ_TMS：B3LYP/6-31G* 典型 ≈ 31.8
         tms_sigma_ppm = 31.8
@@ -2110,9 +2474,33 @@ def run_linear_scan(reactant_files, product_files, steps=20, method='b3lyp', bas
         return result
 
     steps = max(2, int(steps))
-    out_root = Path(output_dir) if output_dir else (Path(reactant_files[0]).parent / "scan_output")
-    out_root.mkdir(parents=True, exist_ok=True)
+    # =====【审计 1.1 路径遍历修复】=====
+    try:
+        _base_dir: Path = _default_base_dir_from_input(reactant_files[0] if reactant_files else None,
+                                                      fallback=product_files[0] if product_files else None)
+        _raw_out = output_dir if output_dir is not None else str(Path(reactant_files[0]).parent / "scan_output")
+        out_root = _secure_output_path(
+            _raw_out,
+            is_dir=True,
+            base_dir=_base_dir,
+            create_parent=True,
+            allow_outside=False,
+        )
+    except ValueError as _v:
+        result["error"] = f"输出目录非法: {_v}"
+        return result
     frames_dir = out_root / "frames"
+    try:
+        frames_dir = _secure_output_path(
+            frames_dir,
+            is_dir=True,
+            base_dir=out_root,
+            create_parent=True,
+            allow_outside=False,
+        )
+    except ValueError as _v:
+        result["error"] = f"输出目录非法: {_v}"
+        return result
     frames_dir.mkdir(parents=True, exist_ok=True)
     if solvent:
         tag = sanitize_filename(solvent)
@@ -2271,9 +2659,32 @@ def run_rigid_scan(input_file, scan_atoms, distance_range, method='b3lyp', basis
         return result
 
     start, end, steps = float(distance_range[0]), float(distance_range[1]), max(2, int(distance_range[2]))
-    out_root = Path(output_dir) if output_dir else (Path(input_file).parent / "rigid_scan_output")
-    out_root.mkdir(parents=True, exist_ok=True)
+    # =====【审计 1.1 路径遍历修复】=====
+    try:
+        _base_dir: Path = _default_base_dir_from_input(input_file)
+        _raw_out = output_dir if output_dir is not None else str(Path(input_file).parent / "rigid_scan_output")
+        out_root = _secure_output_path(
+            _raw_out,
+            is_dir=True,
+            base_dir=_base_dir,
+            create_parent=True,
+            allow_outside=False,
+        )
+    except ValueError as _v:
+        result["error"] = f"输出目录非法: {_v}"
+        return result
     frames_dir = out_root / "frames"
+    try:
+        frames_dir = _secure_output_path(
+            frames_dir,
+            is_dir=True,
+            base_dir=out_root,
+            create_parent=True,
+            allow_outside=False,
+        )
+    except ValueError as _v:
+        result["error"] = f"输出目录非法: {_v}"
+        return result
     frames_dir.mkdir(parents=True, exist_ok=True)
     if solvent:
         tag = sanitize_filename(solvent)

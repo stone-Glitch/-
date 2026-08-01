@@ -47,7 +47,17 @@ DEFAULT_CONFIG = {
         "last_task": "energy"
     },
     "preview_before_operation": True,
-    "recent_work_dirs": []
+    "recent_work_dirs": [],
+    # === 一、字太小：可配置字体基线（pt，默认14pt，立刻见效）===
+    # 范围：10 ~ 20。用户可以直接在 mol_manager_config.json 里改。
+    "font_size": 14,
+    # （可选）强制与系统 DPI 一致地放大（缩放 font_size）。True=跟随DPI，False=按 pt 绝对值
+    "font_follow_dpi": True,
+    # === 三、OpenBabel 识别失败：用户可手动指定 obabel 可执行文件路径（绝对路径）===
+    # 空串 = 自动查找（PATH / shutil.which / 常见安装位置）
+    "obabel_path": "",
+    # first_run 由 wizard.py 管理
+    "first_run": True,
 }
 MAX_RECENT_DIRS = 10
 

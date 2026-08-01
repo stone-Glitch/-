@@ -8,6 +8,8 @@ import os
 import sys
 import csv
 import json
+import atexit
+import weakref
 import subprocess
 import threading
 import tkinter as tk
@@ -19,6 +21,59 @@ from constants import PSI4_PRESETS, PSI4_TASKS, SUPPORTED_EXTS, RUN_PRESETS
 import openbabel_utils as ob_utils
 
 
+# ===== dialogs 级临时目录跟踪 + atexit 兜底清理 =====
+# 所有模板按钮 / 对话框临时创建的目录都在这里注册一份，进程结束时统一 rmtree
+_DIALOG_TEMP_DIRS: list[Path] = []
+_DIALOG_TEMP_DIRS_LOCK = threading.Lock()
+
+
+def register_dialog_temp_dir(p) -> None:
+    """把临时目录注册到 atexit 兜底。可以是 str / Path。忽略 None 或空串。"""
+    if not p:
+        return
+    try:
+        pp = Path(p)
+    except Exception:
+        return
+    with _DIALOG_TEMP_DIRS_LOCK:
+        _DIALOG_TEMP_DIRS.append(pp)
+
+
+def unregister_dialog_temp_dir(p) -> None:
+    """手动清理后把注册项移除，避免 atexit 扫一堆已清理的路径。"""
+    if not p:
+        return
+    try:
+        pp = Path(p)
+    except Exception:
+        return
+    with _DIALOG_TEMP_DIRS_LOCK:
+        try:
+            _DIALOG_TEMP_DIRS.remove(pp)
+        except ValueError:
+            pass
+
+
+def force_cleanup_dialog_temp_dirs() -> int:
+    """立即清理所有已注册但还存在的临时目录；返回实际删掉的目录数量。"""
+    with _DIALOG_TEMP_DIRS_LOCK:
+        all_dirs = list(_DIALOG_TEMP_DIRS)
+        _DIALOG_TEMP_DIRS.clear()
+    removed = 0
+    for d in all_dirs:
+        try:
+            if d.exists():
+                import shutil as _shu
+                _shu.rmtree(str(d), ignore_errors=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+atexit.register(force_cleanup_dialog_temp_dirs)
+
+
 class Dialogs:
     def __init__(self, app, controller):
         self.app = app
@@ -27,28 +82,42 @@ class Dialogs:
     # ---- 线程安全的 Text 控件写入（所有后台子线程必须走这个！） ----
     def _append_text(self, widget, text: str, tag: str | None = None, see_end: bool = True) -> None:
         """
-        **线程安全** 把 text 追加到 Tk Text widget。
-        无论在主线程 / 子线程调用都 OK：子线程自动 app.after(0, cb) 回主线程。
+        **线程安全 + 窗口已销毁兜底** 把 text 追加到 Tk Text widget。
+        无论在主线程 / 子线程调用都 OK；widget 已不存在 / 窗口已关闭时静默跳过，
+        避免关闭 PSI4 对话框后后台线程抛出 TclError 污染日志。
         """
         def _do():
             try:
+                # ———— 先确认 widget 还活着（窗口关闭或父控件已 destroy 都会让此处 False）————
+                try:
+                    if not widget.winfo_exists():
+                        return
+                except Exception:
+                    return
                 state = widget.cget("state")
-                if str(state).lower() == "disabled":
+                is_disabled = str(state).lower() == "disabled"
+                if is_disabled:
                     widget.configure(state="normal")
                 if tag:
                     widget.insert(tk.END, str(text), tag)
                 else:
                     widget.insert(tk.END, str(text))
                 if see_end:
-                    widget.see(tk.END)
+                    try:
+                        if widget.winfo_exists():
+                            widget.see(tk.END)
+                    except Exception:
+                        pass
+            except Exception:
+                # cget / insert 过程中 window 被销毁也会抛 TclError，一律吞掉（非致命）
+                pass
             finally:
                 try:
-                    if str(state).lower() == "disabled":
+                    if widget.winfo_exists() and is_disabled:
                         widget.configure(state="disabled")
                 except Exception:
                     pass
         try:
-            # 如果在主线程：直接做；否则 after 调度
             if threading.current_thread() is threading.main_thread():
                 _do()
             else:
@@ -57,16 +126,24 @@ class Dialogs:
             logger.debug("Dialogs._append_text 调度失败: %s", e)
 
     def _clear_text(self, widget) -> None:
-        """**线程安全** 清空 Text widget 内容"""
+        """**线程安全 + 窗口已销毁兜底** 清空 Text widget 内容"""
         def _do():
             try:
+                try:
+                    if not widget.winfo_exists():
+                        return
+                except Exception:
+                    return
                 state = widget.cget("state")
-                if str(state).lower() == "disabled":
+                is_disabled = str(state).lower() == "disabled"
+                if is_disabled:
                     widget.configure(state="normal")
                 widget.delete("1.0", tk.END)
+            except Exception:
+                pass
             finally:
                 try:
-                    if str(state).lower() == "disabled":
+                    if widget.winfo_exists() and is_disabled:
                         widget.configure(state="disabled")
                 except Exception:
                     pass
@@ -191,21 +268,50 @@ class Dialogs:
     def _resolve_iqmol_exe(name_or_path: str) -> str:
         """
         安全解析 IQmol 可执行文件绝对路径：
-        - 用户输入绝对路径 → expanduser + resolve(strict=True) + 拒绝符号链接
+        - 用户输入绝对路径 → expanduser + resolve(strict=True) + 允许符号链接
         - 用户输入相对名 → shutil.which 解析到 PATH 中的绝对路径，解析失败直接抛 RuntimeError
-        拒绝执行相对名，因为 Windows CreateProcessW 会先搜当前目录。
+        - 无论哪种方式，**真实路径**都不能在 tempdir / cwd / 用户主目录（防止工作目录同名恶意可执行劫持）
+        - 拒绝执行相对名，因为 Windows CreateProcessW 会先搜当前目录。
+
+        H-1 修复：不再拒绝符号链接；Linux/macOS 下 /usr/local/bin/IQmol 几乎都是 symlink，
+        之前的检查会导致 IQmol 永远找不到。
         """
         import shutil as _shutil
+        import tempfile as _tempfile
+
+        def _safe_real(p: Path, *, display_name: str = "IQmol") -> Path:
+            try:
+                real = p.resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeError(f"{display_name} 路径不存在或不可读: {p}") from exc
+            if not real.is_file():
+                raise RuntimeError(f"{display_name} 路径不是文件: {real}")
+            # 拒绝 tempdir / cwd / home 下的真实可执行（用户可写目录，可能存在同名恶意文件）
+            unsafe_roots: list[Path] = []
+            for _cand in (
+                _tempfile.gettempdir(),
+                os.getcwd(),
+                os.path.expanduser("~"),
+            ):
+                try:
+                    unsafe_roots.append(Path(_cand).resolve(strict=False))
+                except Exception:
+                    pass
+            for root in unsafe_roots:
+                try:
+                    real.relative_to(root)
+                    raise RuntimeError(
+                        f"出于安全考虑，拒绝执行在可写目录下的 {display_name} 真实路径: {real}（父目录={root}），"
+                        "请使用系统路径（如 /Applications/IQmol.app/Contents/MacOS/IQmol）下的安装。"
+                    )
+                except ValueError:
+                    pass
+            return real
+
         candidate = str(name_or_path).strip() or "IQmol"
         if os.sep in candidate or (os.altsep and os.altsep in candidate) or Path(candidate).is_absolute():
             abs_path = Path(candidate).expanduser()
-            try:
-                abs_path = abs_path.resolve(strict=True)
-            except OSError as exc:
-                raise RuntimeError(f"IQmol 路径不存在或不可读: {candidate}") from exc
-            if abs_path.is_symlink() or not abs_path.is_file():
-                raise RuntimeError(f"IQmol 路径必须是真实可执行文件而非链接: {abs_path}")
-            return str(abs_path)
+            return str(_safe_real(abs_path, display_name="IQmol"))
         # 仅接受大写 IQmol / 小写 iqmol，避免常见大小写拼错时 which 不到
         resolved: str | None = None
         for name in filter(None, {candidate, candidate.lower(), "IQmol", "iqmol"}):
@@ -218,14 +324,7 @@ class Dialogs:
                 f"未在 PATH 中找到 IQmol（当前输入: {candidate!r}），请安装并添加到 PATH，"
                 "或在对话框中指定 IQmol 可执行文件的绝对路径（已拒绝使用相对名执行，防止工作目录同名恶意可执行劫持）。"
             )
-        abs_resolved = Path(resolved)
-        try:
-            abs_resolved = abs_resolved.resolve(strict=True)
-        except OSError as exc:
-            raise RuntimeError(f"IQmol 解析出的路径不存在: {resolved}") from exc
-        if abs_resolved.is_symlink() or not abs_resolved.is_file():
-            raise RuntimeError(f"IQmol 路径必须是真实文件: {abs_resolved}")
-        return str(abs_resolved)
+        return str(_safe_real(Path(resolved), display_name="IQmol"))
 
     def _safe_open_file(self, target: str | os.PathLike[str]) -> None:
         """
@@ -335,9 +434,14 @@ class Dialogs:
             return
 
         from psi4_compute import check_psi4_installed
-        if not check_psi4_installed():
-            self.app.helpers.on_log("❌ PSI4 未安装，请运行: conda install -c psi4 psi4", 'error')
+        _ok, _msg, _det = check_psi4_installed()
+        if not _ok:
+            self.app.helpers.on_log(f"❌ {_msg}", 'error')
             return
+        # 显示警告（例如 CPHF NMR 没开）：把 warnings 列出来给用户
+        for _w in _det.get("warnings", []):
+            self.app.helpers.on_log(f"⚠️ {_w}", 'warning')
+        self.app.helpers.on_log(f"✅ {_msg}", 'info')
 
         dialog = tk.Toplevel(self.app)
         dialog.title("⚡ PSI4 计算设置")
@@ -351,12 +455,44 @@ class Dialogs:
         frame1 = ttk.Frame(dialog)
         frame1.pack(pady=5, fill=tk.X, padx=10)
         ttk.Label(frame1, text="任务类型:").pack(side=tk.LEFT, padx=5)
-        task_var = tk.StringVar(value=self.app.psi4_last_task)
-        task_menu = ttk.Combobox(frame1, textvariable=task_var, values=list(PSI4_TASKS.keys()), state="readonly", width=15)
+        # 汉化：下拉直接显示中文，内部用英文 key 做真实计算值
+        TASK_DISPLAY_TO_KEY = {v: k for k, v in PSI4_TASKS.items()}
+        TASK_KEY_TO_DISPLAY = dict(PSI4_TASKS)
+        initial_key = self.app.psi4_last_task
+        if initial_key not in TASK_KEY_TO_DISPLAY:
+            initial_key = "energy"
+        task_var = tk.StringVar(value=initial_key)
+        task_menu_var = tk.StringVar(value=TASK_KEY_TO_DISPLAY[initial_key])
+        task_menu = ttk.Combobox(
+            frame1,
+            textvariable=task_menu_var,
+            values=list(TASK_DISPLAY_TO_KEY.keys()),
+            state="readonly",
+            width=15,
+        )
         task_menu.pack(side=tk.LEFT, padx=5)
-        task_desc_var = tk.StringVar(value=PSI4_TASKS.get(self.app.psi4_last_task, ""))
+        task_desc_var = tk.StringVar(value=TASK_KEY_TO_DISPLAY[initial_key])
         ttk.Label(frame1, textvariable=task_desc_var, foreground="gray").pack(side=tk.LEFT, padx=10)
-        task_menu.bind("<<ComboboxSelected>>", lambda e: task_desc_var.set(PSI4_TASKS.get(task_var.get(), "")))
+
+        def _sync_from_display(*_args, **_kwargs):
+            """下拉的中文 -> task_var(英文key) + task_desc_var(中文) 同步。"""
+            disp = task_menu_var.get()
+            if disp in TASK_DISPLAY_TO_KEY:
+                real_key = TASK_DISPLAY_TO_KEY[disp]
+                task_var.set(real_key)
+                task_desc_var.set(disp)
+
+        def _sync_from_key(*_args, **_kwargs):
+            """别处修改了 task_var(英文key) -> 下拉显示同步回中文。"""
+            real_key = task_var.get()
+            if real_key in TASK_KEY_TO_DISPLAY:
+                disp = TASK_KEY_TO_DISPLAY[real_key]
+                task_menu_var.set(disp)
+                task_desc_var.set(disp)
+
+        task_menu_var.trace_add("write", _sync_from_display)
+        task_menu.bind("<<ComboboxSelected>>", lambda e: _sync_from_display())
+        task_var.trace_add("write", _sync_from_key)
 
         # 运行级别
         frame_runlevel = ttk.Frame(dialog)
@@ -500,20 +636,15 @@ class Dialogs:
         )).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=10)
 
-        task_desc_var.set(PSI4_TASKS.get(task_var.get(), ""))
+        # 根据任务类型初始显示扫描参数：用 task_var 追踪（无论是用户切换下拉还是运行级别预设改任务都会生效）
+        def on_task_var_changed(*_args, **_kwargs):
+            if task_var.get() == 'scan':
+                self.scan_frame.pack(pady=5, fill=tk.X, padx=10, before=advanced_frame)
+            else:
+                self.scan_frame.pack_forget()
 
-        # 根据任务类型初始显示扫描参数
-        if task_var.get() == 'scan':
-            self.scan_frame.pack(pady=5, fill=tk.X, padx=10, before=advanced_frame)
-        else:
-            self.scan_frame.pack_forget()
-            # 绑定任务切换事件
-            def on_task_change(event):
-                if task_var.get() == 'scan':
-                    self.scan_frame.pack(pady=5, fill=tk.X, padx=10, before=advanced_frame)
-                else:
-                    self.scan_frame.pack_forget()
-            task_menu.bind("<<ComboboxSelected>>", on_task_change)
+        task_var.trace_add("write", on_task_var_changed)
+        on_task_var_changed()  # 初始状态
 
         def on_runlevel_change(event):
             value = runlevel_var.get()
@@ -765,10 +896,14 @@ class Dialogs:
 
     # ---------- OpenBabel 工具对话框 ----------
     def show_openbabel_dialog(self):
-        available, msg = ob_utils.check_openbabel()
+        available, msg, det = ob_utils.check_openbabel()
         if not available:
             self.app.helpers.on_log(f"❌ Open Babel 不可用: {msg}", 'error')
             return
+        # 显示警告（例如某功能缺失）
+        for _w in det.get("warnings", []):
+            self.app.helpers.on_log(f"⚠️ OB: {_w}", 'warning')
+        self.app.helpers.on_log(f"✅ OB: {msg}", 'info')
 
         dialog = tk.Toplevel(self.app)
         dialog.title("🔬 Open Babel 工具")
@@ -1320,6 +1455,633 @@ class Dialogs:
         except Exception as e:
             messagebox.showerror("打开失败", f"无法打开文件夹:\n{e}")
 
+    # ============ OB-PATH：OpenBabel 手动路径设置（问题三）============
+    def show_obabel_path_dialog(self, parent=None, on_saved_callback=None) -> None:
+        """
+        打开「OpenBabel 路径设置」对话框：
+          - 显示当前使用的路径（来自自动解析 / 手动配置）
+          - 提供「浏览」选择 obabel(.exe) 可执行文件
+          - 保存按钮：写入 config["obabel_path"] 并生效到 openbabel_utils
+          - 自动测试按钮：调用 check_openbabel() 显示结果
+        """
+        app = self.app
+        parent = parent or app
+        dialog = tk.Toplevel(parent)
+        dialog.title("OpenBabel 路径设置")
+        dialog.transient(parent)
+        dialog.grab_set()
+        try:
+            dialog.geometry("680x300")
+        except Exception:
+            pass
+        try:
+            dialog.configure(bg="#EEF3FF")
+        except Exception:
+            pass
+
+        # —— 字体（跟随用户 config.font_size，避免对话框字体小）——
+        F = getattr(app, "_fonts", {})
+        BASE = F.get("BASE",      ("Microsoft YaHei", 12))
+        BOLD = F.get("BOLD",      ("Microsoft YaHei", 12, "bold"))
+        SMALL = F.get("SMALL",    ("Microsoft YaHei", 11))
+        BTN  = F.get("BTN",       ("Microsoft YaHei", 12, "bold"))
+
+        main = tk.Frame(dialog, bg="#EEF3FF")
+        main.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        tk.Label(main, text="🧭  OpenBabel 可执行文件路径设置",
+                 bg="#EEF3FF", fg="#1A2142",
+                 font=F.get("H1", ("Microsoft YaHei", 14, "bold"))
+                 ).pack(anchor="w", pady=(0, 10))
+
+        tip = ("如果自动找不到 obabel 命令行，可在这里手动选择它的可执行文件\n"
+               "  Windows：obabel.exe（一般在 C:\\Program Files\\OpenBabel-3.1.1\\ 或 ~/Anaconda3/Library/bin/）\n"
+               "  Linux/macOS：一般在 /usr/bin/obabel、~/anaconda3/bin/obabel")
+        tk.Label(main, text=tip, bg="#EEF3FF", fg="#6B7599",
+                 font=SMALL, justify="left").pack(anchor="w", pady=(0, 12))
+
+        # 当前路径
+        row_cur = tk.Frame(main, bg="#EEF3FF")
+        row_cur.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(row_cur, text="当前解析到的路径：", bg="#EEF3FF", fg="#1A2142",
+                 font=BOLD).pack(side=tk.LEFT)
+        cur_var = tk.StringVar(value="(请先点「重新检测」)")
+        cur_label = tk.Label(row_cur, textvariable=cur_var, bg="#FFFFFF", fg="#3B6EFF",
+                             font=SMALL, relief=tk.SUNKEN, padx=8, pady=4, justify="left")
+        cur_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        # 手动输入行
+        row_path = tk.Frame(main, bg="#EEF3FF")
+        row_path.pack(fill=tk.X, pady=(6, 8))
+        tk.Label(row_path, text="手动指定路径：", bg="#EEF3FF", fg="#1A2142",
+                 font=BOLD, width=14, anchor="w").pack(side=tk.LEFT)
+        path_var = tk.StringVar(value=str((getattr(app, "config_data", {}) or {}).get("obabel_path", "") or ""))
+        entry = ttk.Entry(row_path, textvariable=path_var, font=BASE)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+
+        def _browse():
+            filetypes = [("OpenBabel 可执行文件", "*.exe"), ("所有文件", "*.*")] \
+                if sys.platform == "win32" else [("所有文件", "*.*")]
+            initdir = str(Path(path_var.get()).parent) if path_var.get() and os.path.exists(path_var.get()) else os.path.expanduser("~")
+            selected = filedialog.askopenfilename(
+                parent=dialog,
+                title="选择 obabel 可执行文件",
+                initialdir=initdir,
+                filetypes=filetypes,
+            )
+            if selected:
+                path_var.set(selected)
+
+        ttk.Button(row_path, text="浏览…", command=_browse,
+                   style="Aurora.TButton").pack(side=tk.LEFT, padx=(0, 2))
+
+        def _auto():
+            """清除手动路径并重新检测"""
+            path_var.set("")
+            _detect()
+
+        ttk.Button(row_path, text="使用自动查找", command=_auto,
+                   style="Aurora.TButton").pack(side=tk.LEFT, padx=2)
+
+        # 结果 / 建议区
+        result_var = tk.StringVar(value="")
+        res_label = tk.Label(main, textvariable=result_var, bg="#EEF3FF", fg="#1A2142",
+                             font=BASE, justify="left", anchor="w")
+        res_label.pack(fill=tk.X, pady=(4, 8))
+
+        def _detect():
+            # 先把当前输入的路径写入内存（不先写配置，允许取消）
+            v = path_var.get().strip()
+            if v:
+                ob_utils.set_manual_obabel_path(v)
+            else:
+                ob_utils.set_manual_obabel_path(None)
+            ok, msg, det = ob_utils.check_openbabel()
+            cur_var.set(str(det.get("resolved_cli_path") or "(未解析到)")
+                        + ("   （手动路径）" if det.get("manual_path_used") else "   （自动）"))
+            status = ("✅ " + msg) if ok else ("❌ " + msg)
+            result_var.set(status)
+            return ok, msg, det
+
+        def _test():
+            ok, msg, det = _detect()
+            if ok:
+                messagebox.showinfo("OpenBabel 检测通过", f"{msg}\n\n诊断：\n" + "\n  • ".join([""] + (det.get("diagnosis") or ["未发现问题"])))
+            else:
+                lines = [msg]
+                if det.get("diagnosis"):
+                    lines.append("")
+                    lines.append("诊断建议：")
+                    lines.extend("  • " + d for d in det["diagnosis"])
+                lines.append("")
+                lines.append(det.get("install_guide", ""))
+                messagebox.showwarning("OpenBabel 不可用", "\n".join(lines))
+
+        def _save():
+            v = path_var.get().strip()
+            try:
+                cfg = app.config_data if hasattr(app, "config_data") else {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg["obabel_path"] = v
+                app.config_data = cfg
+                try:
+                    from config import save_config
+                    save_config(cfg)
+                except Exception as _se:
+                    logger.warning("保存 obabel_path 到配置失败：%s", _se)
+            except Exception as _e:
+                logger.warning("保存 obabel_path 到 config 失败：%s", _e)
+            # 写内存
+            ob_utils.set_manual_obabel_path(v)
+            # 重新检测并同步状态栏指示灯
+            try:
+                fn = getattr(app.helpers, "check_environment", None)
+                if callable(fn):
+                    fn(announce_missing=False)
+            except Exception:
+                pass
+            result_var.set("✅ 已保存！下次启动仍继续使用该路径。")
+            messagebox.showinfo("已保存", "OpenBabel 路径已写入配置并生效，可点「测试」验证。")
+            if callable(on_saved_callback):
+                try:
+                    on_saved_callback()
+                except Exception:
+                    pass
+
+        btns = tk.Frame(main, bg="#EEF3FF")
+        btns.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btns, text="🔍 重新检测", command=_detect,
+                   style="Aurora.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="🧪 测试可用性", command=_test,
+                   style="Aurora.Primary.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="💾 保存到配置", command=_save,
+                   style="Aurora.BigAccent.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="关闭", command=dialog.destroy,
+                   style="Aurora.TButton").pack(side=tk.RIGHT, padx=4)
+
+        # 打开对话框立即先做一次检测
+        try:
+            dialog.after(50, _detect)
+        except Exception:
+            pass
+
+    # ============ ENV：环境诊断对话框（问题三 + 友好上手）============
+    def show_environment_dialog(self, parent=None, *,
+                                ob_details: dict | None = None,
+                                psi4_details: dict | None = None) -> None:
+        """
+        综合环境诊断：
+          - 显示 OpenBabel 状态（pybel / CLI 双接口）+ 安装指引
+          - 显示 PSI4 是否可用
+          - 提供一键「手动选择 obabel 路径」按钮（复用 show_obabel_path_dialog）
+          - 不阻塞后台线程，用户可继续使用基础功能
+        """
+        app = self.app
+        parent = parent or app
+        dialog = tk.Toplevel(parent)
+        dialog.title("环境诊断 · 分子管理器")
+        dialog.transient(parent)
+        try:
+            dialog.geometry("880x620")
+        except Exception:
+            pass
+        try:
+            dialog.configure(bg="#EEF3FF")
+        except Exception:
+            pass
+
+        F = getattr(app, "_fonts", {})
+        BASE  = F.get("BASE",  ("Microsoft YaHei", 12))
+        BOLD  = F.get("BOLD",  ("Microsoft YaHei", 12, "bold"))
+        SMALL = F.get("SMALL", ("Microsoft YaHei", 11))
+        H1    = F.get("H1",    ("Microsoft YaHei", 14, "bold"))
+        BTN   = F.get("BTN",   ("Microsoft YaHei", 12, "bold"))
+
+        main = tk.Frame(dialog, bg="#EEF3FF")
+        main.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+
+        tk.Label(main, text="🧪  环境诊断（依赖与建议）",
+                 bg="#EEF3FF", fg="#1A2142",
+                 font=H1).pack(anchor="w", pady=(0, 6))
+        tk.Label(main, text="如果某项为红色，可直接点击对应「修复」按钮尝试解决。若仍不通过请参考下方安装指引。",
+                 bg="#EEF3FF", fg="#6B7599",
+                 font=SMALL, justify="left").pack(anchor="w", pady=(0, 14))
+
+        # —— OB 区 ——
+        ob_card = tk.Frame(main, bg="#FFFFFF", bd=0,
+                           highlightbackground="#D7E2FF", highlightthickness=1)
+        ob_card.pack(fill=tk.X, pady=(0, 10))
+        hdr = tk.Frame(ob_card, bg="#FFFFFF")
+        hdr.pack(fill=tk.X, padx=14, pady=(12, 4))
+        tk.Label(hdr, text="OpenBabel 状态", bg="#FFFFFF", fg="#1A2142",
+                 font=BOLD).pack(side=tk.LEFT)
+        ob_status_var = tk.StringVar(value="检测中…")
+        ob_status_lbl = tk.Label(hdr, textvariable=ob_status_var, bg="#FFFFFF", fg="#1A2142",
+                                 font=BOLD, anchor="e")
+        ob_status_lbl.pack(side=tk.RIGHT)
+        ob_text_var = tk.StringVar(value="")
+        tk.Label(ob_card, textvariable=ob_text_var, bg="#FFFFFF", fg="#1A2142",
+                 font=BASE, justify="left", anchor="w",
+                 wraplength=820).pack(fill=tk.X, padx=14, pady=(2, 6))
+        ob_diag_text = scrolledtext.ScrolledText(
+            ob_card, height=7, font=F.get("LOG", ("Consolas", 11)),
+            bg="#F8FAFF", fg="#1A2142", wrap=tk.WORD, bd=1, relief=tk.SOLID,
+            highlightbackground="#D7E2FF", highlightthickness=1,
+        )
+        ob_diag_text.pack(fill=tk.X, padx=14, pady=(2, 10))
+        ob_btn_row = tk.Frame(ob_card, bg="#FFFFFF")
+        ob_btn_row.pack(fill=tk.X, padx=14, pady=(0, 14))
+
+        # —— PSI4 区 ——
+        psi_card = tk.Frame(main, bg="#FFFFFF", bd=0,
+                            highlightbackground="#D7E2FF", highlightthickness=1)
+        psi_card.pack(fill=tk.X, pady=(0, 10))
+        hdr2 = tk.Frame(psi_card, bg="#FFFFFF")
+        hdr2.pack(fill=tk.X, padx=14, pady=(12, 4))
+        tk.Label(hdr2, text="PSI4 状态", bg="#FFFFFF", fg="#1A2142",
+                 font=BOLD).pack(side=tk.LEFT)
+        psi_status_var = tk.StringVar(value="检测中…")
+        tk.Label(hdr2, textvariable=psi_status_var, bg="#FFFFFF", fg="#1A2142",
+                 font=BOLD, anchor="e").pack(side=tk.RIGHT)
+        psi_text_var = tk.StringVar(value="")
+        tk.Label(psi_card, textvariable=psi_text_var, bg="#FFFFFF", fg="#1A2142",
+                 font=BASE, justify="left", anchor="w",
+                 wraplength=820).pack(fill=tk.X, padx=14, pady=(2, 14))
+
+        # —— 底部：安装指引 ——
+        guide_card = tk.LabelFrame(main, text="  📘 OpenBabel 安装指引 / 故障排查  ",
+                                   bg="#FFFFFF", fg="#1A2142", font=BOLD,
+                                   relief=tk.GROOVE, bd=2)
+        guide_card.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        guide_text = scrolledtext.ScrolledText(
+            guide_card, height=12, font=F.get("LOG", ("Consolas", 11)),
+            bg="#F8FAFF", fg="#1A2142", wrap=tk.WORD, bd=0,
+        )
+        guide_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        guide_text.configure(state="normal")
+        guide_text.insert(tk.END, ob_utils.OB_INSTALL_GUIDE)
+        guide_text.configure(state="disabled")
+
+        # —— 按钮区 ——
+        btns = tk.Frame(main, bg="#EEF3FF")
+        btns.pack(fill=tk.X)
+        def _rerun_all():
+            _fill_ob()
+            _fill_psi4()
+
+        def _open_manual_path():
+            try:
+                self.show_obabel_path_dialog(parent=dialog, on_saved_callback=_fill_ob)
+            except Exception as _e:
+                messagebox.showerror("打开失败", f"无法打开 OpenBabel 路径设置对话框：{_e}")
+
+        ttk.Button(btns, text="🔁 重新检测", command=_rerun_all,
+                   style="Aurora.Primary.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="🧭 手动选择 obabel 路径…", command=_open_manual_path,
+                   style="Aurora.BigAccent.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="关闭", command=dialog.destroy,
+                   style="Aurora.TButton").pack(side=tk.RIGHT, padx=4)
+
+        # —— 数据填充函数 ——
+        def _fill_ob():
+            try:
+                ob_ok, ob_msg, det = ob_utils.check_openbabel()
+                if ob_details is None:
+                    # 用于外部 caller 想要详情的情况（本函数内部无需再赋值给外层引用）
+                    pass
+                ob_status_var.set(("✅ 可用" if ob_ok else "❌ 不可用"))
+                try:
+                    ob_status_lbl.configure(fg=("#0EA288" if ob_ok else "#E5484D"))
+                except Exception:
+                    pass
+                parts = [ob_msg]
+                if det.get("resolved_cli_path"):
+                    parts.append(f"  CLI 路径：{det['resolved_cli_path']}"
+                                 + ("  （手动指定）" if det.get("manual_path_used") else ""))
+                if det.get("pybel_version"):
+                    parts.append(f"  pybel 版本：{det['pybel_version']}")
+                if det.get("cli_version"):
+                    parts.append(f"  CLI 版本：{det['cli_version']}")
+                if det.get("supported_format_count"):
+                    parts.append(f"  支持格式数：约 {det['supported_format_count']} 种")
+                ob_text_var.set("\n".join(parts))
+
+                diags: list[str] = []
+                for w in (det.get("warnings") or []):
+                    diags.append(f"[WARN]  {w}")
+                for d in (det.get("diagnosis") or []):
+                    diags.append(f"[TIP]   {d}")
+                if not diags:
+                    diags.append("[OK]   未发现异常。")
+                try:
+                    ob_diag_text.configure(state="normal")
+                    ob_diag_text.delete("1.0", tk.END)
+                    ob_diag_text.insert(tk.END, "\n".join(diags))
+                finally:
+                    try:
+                        ob_diag_text.configure(state="disabled")
+                    except Exception:
+                        pass
+            except Exception as _oe:
+                ob_status_var.set("⚠️ 检测失败")
+                ob_text_var.set(str(_oe))
+
+        def _fill_psi4():
+            try:
+                import psi4  # type: ignore
+                v = getattr(psi4, "__version__", None)
+                psi_status_var.set("✅ 可用" if v else "✅ 可导入")
+                try:
+                    psi_status_var.set  # noop 兼容
+                except Exception:
+                    pass
+                psi_text_var.set(
+                    f"Python 包 psi4 已导入（版本 {v or '未声明'}）。\n"
+                    "如果运行任务失败，一般是内存不足、方法/基组不兼容或任务超时，可在右侧「🔬 计算与动画」页面的任务输出日志查看详情。"
+                )
+            except Exception as _pe:
+                psi_status_var.set("⚠️ 未导入")
+                psi_text_var.set(
+                    "未检测到 Python 包 psi4（不影响文件整理/OpenBabel 工具）。\n"
+                    "如需使用量化计算/刚性扫描/动画等能力，建议执行：\n"
+                    "    conda install -c conda-forge psi4 resp gcp-correction dftd4"
+                    f"\n详细错误：{_pe}"
+                )
+            # 同步外部引用（如果调用方给了）
+            if isinstance(psi4_details, dict):
+                try:
+                    psi4_details.clear()
+                    psi4_details["ok"] = (psi_status_var.get().startswith("✅"))
+                    psi4_details["message"] = psi_text_var.get()
+                except Exception:
+                    pass
+
+        # 对话框打开后先跑一次检测
+        try:
+            dialog.after(80, _fill_ob)
+            dialog.after(140, _fill_psi4)
+        except Exception:
+            _fill_ob()
+            _fill_psi4()
+
+    # ============ FONT：字体大小设置（滑块 + 预览 + 保存）============
+    def show_font_size_dialog(self, parent=None) -> None:
+        """
+        字体大小对话框：
+          - 范围 8 ~ 22pt（滑块），右侧数字 Entry 亦可直接输
+          - 实时预览 Label
+          - 保存按钮：写入 config["font_size"] 并持久化，然后问用户是否立即重启生效
+            （已创建的控件不会自动重绘；未重启前会尽力 update 几个常见样式）
+        """
+        app = self.app
+        parent = parent or app
+        dialog = tk.Toplevel(parent)
+        dialog.title("字体大小设置")
+        dialog.transient(parent)
+        dialog.grab_set()
+        try:
+            dialog.geometry("680x360")
+        except Exception:
+            pass
+        try:
+            dialog.configure(bg="#EEF3FF")
+        except Exception:
+            pass
+
+        F = getattr(app, "_fonts", {})
+        BASE  = F.get("BASE",  ("Microsoft YaHei", 12))
+        BOLD  = F.get("BOLD",  ("Microsoft YaHei", 12, "bold"))
+        SMALL = F.get("SMALL", ("Microsoft YaHei", 11))
+        H1    = F.get("H1",    ("Microsoft YaHei", 14, "bold"))
+
+        # —— 读取当前值 & 配置 ——
+        try:
+            cfg = getattr(app, "config_data", None)
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cur = int(cfg.get("font_size", 14) or 14)
+        except Exception:
+            cur = 14
+        if cur < 8:
+            cur = 8
+        if cur > 24:
+            cur = 24
+
+        main = tk.Frame(dialog, bg="#EEF3FF")
+        main.pack(fill=tk.BOTH, expand=True, padx=20, pady=18)
+
+        tk.Label(main, text="🔤  界面字体大小",
+                 bg="#EEF3FF", fg="#1A2142",
+                 font=H1).pack(anchor="w", pady=(0, 2))
+        tk.Label(main,
+                 text="调整后会保存到配置文件。由于 Tkinter 已创建控件的字体不会被全局 option_add 自动刷新，\n"
+                      "保存后建议按提示「立即重启」，即可让全部界面完整使用新字号。",
+                 bg="#EEF3FF", fg="#6B7599", font=SMALL, justify="left"
+                 ).pack(anchor="w", pady=(0, 14))
+
+        # —— 滑块 + 数字显示 ——
+        row = tk.Frame(main, bg="#EEF3FF")
+        row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(row, text="字号（pt）：", bg="#EEF3FF", fg="#1A2142",
+                 font=BOLD).pack(side=tk.LEFT)
+        val_var = tk.IntVar(value=cur)
+        # 数字输入框（可直接输入）
+        spin = tk.Spinbox(row, from_=8, to=24, textvariable=val_var, width=4,
+                          font=BOLD, justify="center", bd=2, relief=tk.SOLID,
+                          bg="#FFFFFF", fg="#1A2142", buttonbackground="#DEE8FF")
+        spin.pack(side=tk.LEFT, padx=(6, 0))
+
+        # —— 滑块 ——
+        slider_row = tk.Frame(main, bg="#EEF3FF")
+        slider_row.pack(fill=tk.X, pady=(4, 10))
+        scale = tk.Scale(slider_row, from_=8, to=24, orient=tk.HORIZONTAL,
+                         variable=val_var, showvalue=False,
+                         font=SMALL, bg="#EEF3FF", fg="#1A2142",
+                         troughcolor="#D7E2FF", activebackground="#3B6EFF",
+                         sliderlength=26, sliderrelief=tk.RAISED, borderwidth=1,
+                         highlightthickness=0)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(slider_row, textvariable=val_var, bg="#EEF3FF", fg="#3B6EFF",
+                 font=BOLD, width=3, anchor="center").pack(side=tk.LEFT, padx=(8, 0))
+
+        # —— 预览卡片 ——
+        prev = tk.LabelFrame(main, text="  🧿 实时预览（仅预览 Label/Button 字体）  ",
+                             bg="#FFFFFF", fg="#1A2142", font=BOLD,
+                             relief=tk.GROOVE, bd=2)
+        prev.pack(fill=tk.BOTH, expand=True, pady=(4, 10))
+        prev_inner = tk.Frame(prev, bg="#FFFFFF")
+        prev_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        preview_base_label = tk.Label(prev_inner,
+                                      text="普通文字 Label：ABC 中文 English 123 （预览字号会随滑块实时变化）",
+                                      bg="#FFFFFF", fg="#1A2142")
+        preview_base_label.pack(anchor="w", pady=(0, 4))
+        preview_bold_label = tk.Label(prev_inner,
+                                      text="加粗文字 Label：粗体中文 / Bold English / 标题风格",
+                                      bg="#FFFFFF", fg="#3B6EFF")
+        preview_bold_label.pack(anchor="w", pady=(0, 6))
+        preview_btn = tk.Button(prev_inner, text="示例按钮 Button", relief=tk.RAISED, bd=1,
+                                bg="#DEE8FF", fg="#1A2142", activebackground="#C8D9FF",
+                                cursor="hand2")
+        preview_btn.pack(anchor="w", pady=(0, 4))
+        preview_code = tk.Label(prev_inner,
+                                text='Consolas 日志字体预览：log.info("hello world")  12345',
+                                bg="#F8FAFF", fg="#1A2142", relief=tk.SUNKEN, bd=1,
+                                justify="left", anchor="w", padx=8, pady=4)
+        preview_code.pack(anchor="w", fill=tk.X, pady=(2, 0))
+
+        def _apply_preview(*_a):
+            try:
+                pt = int(val_var.get())
+            except Exception:
+                return
+            if pt < 8:
+                pt = 8
+            if pt > 24:
+                pt = 24
+            # 中文用 Microsoft YaHei，代码用 Consolas（不缩放过度）
+            cn_face = "Microsoft YaHei"
+            en_face = "Consolas"
+            try:
+                preview_base_label.configure(font=(cn_face, pt))
+            except Exception:
+                pass
+            try:
+                preview_bold_label.configure(font=(cn_face, pt, "bold"))
+            except Exception:
+                pass
+            try:
+                log_pt = max(9, pt - 1)
+                preview_btn.configure(font=(cn_face, pt, "bold"))
+                preview_code.configure(font=(en_face, log_pt))
+            except Exception:
+                pass
+
+        _apply_preview()
+        val_var.trace_add("write", lambda *_args: _apply_preview())
+
+        # —— 保存按钮 ——
+        btns = tk.Frame(main, bg="#EEF3FF")
+        btns.pack(fill=tk.X, pady=(8, 0))
+
+        def _save_and_maybe_restart():
+            try:
+                pt = int(val_var.get())
+            except Exception:
+                messagebox.showerror("错误", "请填写合法的整数字号（8~24）", parent=dialog)
+                return
+            if pt < 8 or pt > 24:
+                messagebox.showwarning("范围超限", "字号建议在 8 到 24 之间，已自动修正。", parent=dialog)
+                pt = max(8, min(24, pt))
+                val_var.set(pt)
+            # —— 写内存 ——
+            try:
+                cfg = getattr(app, "config_data", None)
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg["font_size"] = pt
+                app.config_data = cfg
+            except Exception as _e1:
+                logger.warning("写 font_size 到内存 config_data 失败：%s", _e1)
+            # —— 写磁盘 ——
+            try:
+                from config import save_config
+                save_config(app.config_data)
+            except Exception as _e2:
+                messagebox.showerror("保存失败", f"写入配置文件失败：\n{_e2}", parent=dialog)
+                return
+            # —— 立刻尽力刷新已有样式（对 ttk.Style 和 Text 等做一次 patch，不保证全部）——
+            try:
+                from ui_builder import resolve_font_specs
+                resolve_font_specs(app, force_pt=pt)
+            except Exception as _e3:
+                logger.debug("resolve_font_specs 热更新失败：%s", _e3)
+            try:
+                new_f = getattr(app, "_fonts", {})
+                new_base = new_f.get("BASE", ("Microsoft YaHei", pt))
+                app.option_add("*Font", new_base)
+            except Exception:
+                pass
+            # —— 问用户是否立即重启 ——
+            if messagebox.askyesno(
+                "已保存 · 建议重启",
+                f"字号已成功保存为 {pt} pt。\n\n"
+                "新字号会在「下次启动」时完整生效。是否立即重启本程序以立即看到完整效果？\n\n"
+                "（未重启前：部分已创建控件可能仍沿用旧字号，属于 Tkinter 的正常现象。）",
+                parent=dialog,
+            ):
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                try:
+                    self.app.after(120, self._restart_app)
+                except Exception as _rest_e:
+                    messagebox.showinfo(
+                        "重启失败",
+                        f"自动重启失败，请手动关闭后重新打开：{_rest_e}",
+                        parent=parent,
+                    )
+            else:
+                messagebox.showinfo(
+                    "已保存",
+                    f"字号已保存为 {pt} pt。下次启动即可完整生效。",
+                    parent=dialog,
+                )
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+
+        def _reset_default():
+            val_var.set(14)
+
+        ttk.Button(btns, text="↺ 恢复默认 14pt", command=_reset_default,
+                   style="Aurora.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="取消", command=dialog.destroy,
+                   style="Aurora.TButton").pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="💾 保存并应用（建议重启）",
+                   command=_save_and_maybe_restart,
+                   style="Aurora.BigAccent.TButton").pack(side=tk.RIGHT, padx=4)
+
+    def _restart_app(self) -> None:
+        """
+        用当前 Python 解释器重跑当前主脚本。
+        仅在用户确认「立即重启」时调用。
+        """
+        try:
+            import subprocess as _sp
+            argv0 = sys.argv[0] if sys.argv else os.path.abspath("main.py")
+            # 切换到当前 exe / py 文件所在目录（与首次启动一致）
+            try:
+                work_d = os.path.dirname(os.path.abspath(argv0)) or os.getcwd()
+            except Exception:
+                work_d = os.getcwd()
+            _sp.Popen([sys.executable, argv0, *sys.argv[1:]],
+                      cwd=work_d, close_fds=True)
+        except Exception as _e:
+            from tkinter import messagebox as _mb
+            _mb.showerror("自动重启失败", f"请手动关闭后重新打开：\n{_e}")
+            return
+        # 退出当前进程：先优雅关窗口
+        try:
+            try:
+                self.app.on_close()
+            except Exception:
+                pass
+            try:
+                self.app.destroy()
+            except Exception:
+                pass
+        finally:
+            try:
+                os._exit(0)
+            except Exception:
+                sys.exit(0)
+
+
+
     # ============ O3：分子式 / 元素分析弹窗 ============
     def show_formula_dialog(self):
         sel = self.app.helpers.get_selected_filenames()
@@ -1739,29 +2501,61 @@ class Dialogs:
             import tempfile
             import shutil as _shu
             r_list.delete(0, tk.END); p_list.delete(0, tk.END)
-            td = Path(tempfile.mkdtemp(prefix="ra_tpl_"))
-            # 注册 WM_DELETE_WINDOW：用户关对话框时清理模板目录
-            _orig_close_ref = [getattr(dialog, "_orig_close_ra_tpl_", None)]
-            if _orig_close_ref[0] is None:
-                def _cleanup_and_close(_td=td):
-                    # 清理模板产生的临时目录
+
+            # M-1 修复：用集合记录本对话框整个生命周期内所有模板创建过的临时目录，
+            # 不再只记录「最后一个」；WM_DELETE_WINDOW / <Destroy> 事件 / atexit 三条路径
+            # 都会对整个集合一次性清理，避免用户疯狂切换模板时早期目录残留到 atexit 才清。
+            tpl_dirs: set[Path] | None = getattr(dialog, "_ra_tpl_dirs", None)
+            if tpl_dirs is None:
+                tpl_dirs = set()
+                dialog._ra_tpl_dirs = tpl_dirs  # type: ignore[attr-defined]
+
+                def _cleanup_all_tpl_dirs() -> None:
+                    """清理集合中所有仍存在的 ra_tpl_ 临时目录；幂等，重复调用无害。"""
+                    # 从 dialog 上摘下集合，避免 <Destroy> 和 WM_DELETE_WINDOW 各自执行时重复。
+                    ds: set[Path] = getattr(dialog, "_ra_tpl_dirs", None) or set()
                     try:
-                        if _td.exists():
-                            _shu.rmtree(str(_td), ignore_errors=True)
+                        delattr(dialog, "_ra_tpl_dirs")
                     except Exception:
                         pass
-                    # 同时清理已缓存的之前一次的模板目录
-                    prev = getattr(dialog, "_ra_tpl_dir_holder", None)
-                    if prev is not None and getattr(prev, "__class__", None) is Path:
+                    for d_ in list(ds):
                         try:
-                            if prev.exists():
-                                _shu.rmtree(str(prev), ignore_errors=True)
+                            p_ = Path(d_)
+                            if p_.exists():
+                                _shu.rmtree(str(p_), ignore_errors=True)
+                            unregister_dialog_temp_dir(p_)
                         except Exception:
                             pass
-                    dialog.destroy()
-                dialog._orig_close_ra_tpl_ = _cleanup_and_close  # type: ignore[attr-defined]
-                dialog.protocol("WM_DELETE_WINDOW", _cleanup_and_close)  # type: ignore[arg-type]
-            dialog._ra_tpl_dir_holder = td  # type: ignore[attr-defined]  # noqa: E501  keep alive
+
+                # (1) 窗口系统菜单 / 关闭按钮走 protocol
+                dialog.protocol("WM_DELETE_WINDOW", lambda: (_cleanup_all_tpl_dirs(), dialog.destroy()))  # type: ignore[arg-type,return-value]
+
+                # (2) 代码里调用 dialog.destroy()（比如 OK/Cancel 按钮）走 <Destroy> 事件；
+                #     Tk 的 <Destroy> 对子控件也会触发，必须判断 widget 是顶层 dialog 自己。
+                def _on_dialog_destroy(event):
+                    if event.widget is not dialog:
+                        return
+                    _cleanup_all_tpl_dirs()
+                dialog.bind("<Destroy>", _on_dialog_destroy)
+
+            # 先清理上一次模板目录（切换模板时立即释放，不等到对话框关闭）
+            _prev = getattr(dialog, "_ra_tpl_last", None)
+            if _prev is not None:
+                try:
+                    _pp = Path(_prev)
+                    if _pp.exists():
+                        _shu.rmtree(str(_pp), ignore_errors=True)
+                    unregister_dialog_temp_dir(_pp)
+                    tpl_dirs.discard(_pp)
+                except Exception:
+                    pass
+                dialog._ra_tpl_last = None  # type: ignore[attr-defined]
+
+            td = Path(tempfile.mkdtemp(prefix="ra_tpl_"))
+            register_dialog_temp_dir(td)
+            tpl_dirs.add(td)
+            dialog._ra_tpl_last = td  # type: ignore[attr-defined]  # 供下次切换模板时及时清理上一个
+
             for n in r_names:
                 self._ra_add_unique_path(r_list, _resolve_or_build(n, td))
             for n in p_names:
@@ -3172,33 +3966,215 @@ class Dialogs:
         log_text = scrolledtext.ScrolledText(bottom, height=10, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                               insertbackground="white", relief=tk.SOLID, borderwidth=1)
         log_text.pack(fill=tk.BOTH, expand=True)
+        # 先把 3 种颜色 tag 一次性配置好（避免每次 _log 时重复 config）
+        try:
+            log_text.tag_configure("ok", foreground="#4ade80")
+            log_text.tag_configure("warn", foreground="#fbbf24")
+            log_text.tag_configure("err", foreground="#f87171")
+        except Exception:
+            pass
 
-        def _log(msg: str, tag: str | None = None) -> None:
-            safe = msg if msg.endswith("\n") else msg + "\n"
+        # =====================================================================
+        # L-5 修复：show_advanced_tools_dialog 日志出口统一化
+        #
+        # 原问题：高级工具自己用 `_log(msg)` 直接写 log_text，同时偶尔调用
+        #         `logger.*` 输出到 default_logger；如果 default_logger 已挂
+        #         GuiLogHandler，同一条消息会在「对话框 log_text」+「主窗口
+        #         日志面板」都出现（视觉重复），也排障困难。
+        #
+        # 修复方案：
+        #   1) 为高级工具对话框创建一个独立子 logger（adv_tools.<unique>），
+        #      propagate=False：只被本对话框的 handler 处理，不会冒泡到
+        #      default_logger，因此不会触发主窗口 GuiLogHandler 重复显示。
+        #   2) 给这个子 logger 挂两个 handler：
+        #        - 临时 TkTextHandler：写到对话框自己的 log_text（线程安全）
+        #        - 默认继承 default logger 的 level/format（排障时文件或控制台仍能看到）
+        #   3) 原 `_log(msg, tag)` 不再手动 insert 到 Text，而是直接调用
+        #      logger.log()，真正「统一走 logger」。
+        #   4) 对话框关闭时 detach 临时 handler，避免内存泄漏。
+        # =====================================================================
+        import logging as _logging
+        import uuid as _uuid
+        adv_logger_name = f"adv_tools.{_uuid.uuid4().hex[:8]}"
+        adv_logger: _logging.Logger = _logging.getLogger(adv_logger_name)
+        adv_logger.setLevel(_logging.DEBUG)
+        adv_logger.propagate = False  # <—— 关键：不冒泡，避免双写主窗口
+
+        # 子 logger 复用 default logger 已经挂好的「写文件 / 写 stderr」handler，
+        # 保证排障能看到完整 log；不直接用 default_logger 本体避免 GuiLogHandler
+        # 又给主窗口 log_text 塞一份。
+        for _h in list(default_logger.handlers):
             try:
-                import datetime as _dt
-                ts = _dt.datetime.now().strftime("%H:%M:%S")
+                handler_type_name = type(_h).__name__
             except Exception:
-                ts = ""
-            if tag is None:
-                log_text.insert(tk.END, f"[{ts}] {safe}")
-            else:
-                log_text.insert(tk.END, f"[{ts}] {safe}", tag)
-            log_text.see(tk.END)
+                handler_type_name = ""
+            # 过滤掉 default_logger 上挂的 GUI handler（只写给主窗口的）
+            if handler_type_name == "GuiLogHandler":
+                continue
             try:
-                log_text.tag_configure("ok", foreground="#4ade80")
-                log_text.tag_configure("warn", foreground="#fbbf24")
-                log_text.tag_configure("err", foreground="#f87171")
+                adv_logger.addHandler(_h)
             except Exception:
                 pass
 
-        def _progress(perc: float, msg: str) -> None:
+        class _TkTextHandler(_logging.Handler):
+            """把 adv_logger 的日志打到当前对话框自己的 log_text（非主窗口）。"""
+
+            def __init__(self, app_ref, text_widget):
+                super().__init__(_logging.DEBUG)
+                try:
+                    self._app_ref = weakref.ref(app_ref)
+                except TypeError:
+                    self._app_ref = lambda: app_ref
+                self._text = text_widget
+
+            def emit(self, record: _logging.LogRecord):
+                msg: str = self.format(record)
+                # 把 logging 级别翻译成对话框原来的 tag 名字（ok/warn/err/None）
+                lv = record.levelno
+                if lv >= _logging.ERROR:
+                    tag = "err"
+                elif lv >= _logging.WARNING:
+                    tag = "warn"
+                elif lv >= getattr(_logging, "SUCCESS", 25):
+                    tag = "ok"
+                else:
+                    tag = None
+                app_r = self._app_ref()
+                if app_r is None:
+                    return
+                try:
+                    if threading.current_thread() is threading.main_thread():
+                        self._write(msg, tag)
+                    else:
+                        try:
+                            app_r.after(0, lambda: self._write(msg, tag))
+                        except Exception:
+                            # app 已经 destroy / after 不可用：至少别吞掉
+                            try:
+                                print(msg)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            def _write(self, text: str, tag: str | None) -> None:
+                """只在主线程调用：真正写 Text、tag、滚动。"""
+                try:
+                    import datetime as _dt
+                    ts = _dt.datetime.now().strftime("%H:%M:%S")
+                except Exception:
+                    ts = ""
+                safe = text if text.endswith("\n") else text + "\n"
+                block = f"[{ts}] {safe}"
+                try:
+                    if not self._text.winfo_exists():
+                        return
+                    state = self._text.cget("state")
+                    was_disabled = str(state).lower() == "disabled"
+                    if was_disabled:
+                        self._text.configure(state="normal")
+                    try:
+                        if tag is None:
+                            self._text.insert(tk.END, block)
+                        else:
+                            self._text.insert(tk.END, block, tag)
+                        try:
+                            if self._text.winfo_exists():
+                                self._text.see(tk.END)
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            if self._text.winfo_exists() and was_disabled:
+                                self._text.configure(state="disabled")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        _text_handler = _TkTextHandler(app, log_text)
+        try:
+            # 保持和 default_logger 相同 formatter（通常带 level/module 但这里简单）
+            from logger import default_logger as _dflt
+            if _dflt.handlers:
+                _fmt = getattr(_dflt.handlers[0], "formatter", None)
+                if _fmt:
+                    _text_handler.setFormatter(_fmt)
+        except Exception:
+            pass
+        adv_logger.addHandler(_text_handler)
+
+        # 关闭时一定卸 handler（子 logger 会 GC，但 handler 引用了 widget weakref 其实也 OK，多一道无坏处）
+        def _cleanup_adv_logger_handlers() -> None:
+            try:
+                adv_logger.removeHandler(_text_handler)
+                try:
+                    _text_handler.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        _old_dialog_destroy_func = dialog.destroy
+
+        def _safe_dialog_destroy(*args, **kwargs):
+            _cleanup_adv_logger_handlers()
+            try:
+                _old_dialog_destroy_func(*args, **kwargs)
+            except Exception:
+                pass
+
+        dialog.destroy = _safe_dialog_destroy  # type: ignore[method-assign]
+        dialog.protocol("WM_DELETE_WINDOW", _safe_dialog_destroy)  # type: ignore[arg-type]
+
+        def _map_tag_to_level(tag: str | None) -> int:
+            t = (tag or "").lower()
+            if t in {"err", "error", "fail", "failed"}:
+                return _logging.ERROR
+            if t in {"warn", "warning", "skip"}:
+                return _logging.WARNING
+            if t in {"ok", "success", "done"}:
+                # SUCCESS 是我们给 default logger 注册的自定义 level（25）
+                return getattr(_logging, "SUCCESS", 25)
+            if t in {"debug", "dbg"}:
+                return _logging.DEBUG
+            return _logging.INFO
+
+        def _log(msg: str, tag: str | None = None) -> None:
+            """
+            L-5 修复后：任何线程都 OK。不再自己手写 Text 控件，**统一走 logger**。
+            输出路径：adv_logger → _TkTextHandler → 对话框自己的 log_text（只这个框有）
+                    → 同时复用 default_logger 的文件 / stderr handler。
+            不会触发主窗口 GuiLogHandler（因为 propagate=False），避免重复显示。
+            """
+            try:
+                level = _map_tag_to_level(tag)
+                adv_logger.log(level, msg)
+            except Exception:
+                try:
+                    print(f"[ADV_TOOLS] {msg}")
+                except Exception:
+                    pass
+
+        def _do_set_progress_in_main(perc: float) -> None:
             try:
                 progress_var.set(float(perc))
             except Exception:
                 pass
+
+        def _progress(perc: float, msg: str) -> None:
+            """
+            **线程安全** 的进度条写入。
+              - progress_var.set() 一定 app.after(0) 回主线程。
+              - msg 部分通过已安全的 _log() 写（_log 自己会判断线程）。
+            """
+            try:
+                app.after(0, lambda p=float(perc): _do_set_progress_in_main(p))
+            except Exception:
+                pass
             if msg:
-                app.after(0, lambda: _log(f"⏳ {perc:>3.0f}%  {msg}"))
+                # ⚠️ 用已安全的 _log()，而不是之前的 lambda: _log 再包一层 after（会重复调度，但也是安全）
+                _log(f"⏳ {float(perc):>3.0f}%  {msg}")
 
         def _sel_path() -> str | None:
             files = app.helpers.get_selected_files()
@@ -3228,18 +4204,54 @@ class Dialogs:
             except Exception as e:
                 _log(f"打开目录失败：{e}", "warn")
 
-        def _in_thread(fn, *args, done=None):
-            def _run():
+        # ------------- 改用 TaskManager.run_async（共享全局线程池，不再手搓 Thread）-------------
+        # 这个对话框内的所有 _work 函数都必须自己调用 _progress / _log 来写输出
+        # （TaskManager 自带的 _progress_callback / _log 我们不直接对外暴露，
+        #  因为高级工具已经有自己的专属 log_text 和 progress_var）
+        from task_manager import TaskManager
+        _tm = TaskManager(app, controller=None)
+
+        def _submit_work(fn, *, on_done=None) -> None:
+            """
+            把 fn 提交到线程池。fn 本身是「0 参数」callable；如需参数，
+            请在构造时用闭包/partial 绑定（和之前 _in_thread(fn, *args) 不同，这里避免传参歧义）。
+            on_done(result) 会在主线程被调用。
+            """
+            def _on_ok(r) -> None:
                 try:
-                    r = fn(*args)
-                    app.after(0, lambda: done(r) if done else None)
-                except Exception as e:
-                    import traceback as _tb
-                    app.after(0, lambda: (_log("✖ 运行出错 " + str(e), "err"),
-                                           _log(_tb.format_exc(), "err")))
-                    app.after(0, lambda: progress_var.set(0.0))
-            import threading as _th
-            _th.Thread(target=_run, daemon=True).start()
+                    if on_done is not None:
+                        on_done(r)
+                except Exception as _e_done:
+                    _log(f"✖ 回调 on_done 异常：{_e_done}", "err")
+                finally:
+                    # 结束时统一把进度条重置到 0（在主线程）
+                    try:
+                        app.after(0, lambda: _do_set_progress_in_main(0.0))
+                    except Exception:
+                        pass
+
+            def _on_err(err_msg: str) -> None:
+                _log(f"✖ 后台任务失败：{err_msg}", "err")
+                try:
+                    app.after(0, lambda: _do_set_progress_in_main(0.0))
+                except Exception:
+                    pass
+
+            _tm.run_async(
+                _wrap_throwaway_task(fn),
+                on_done=_on_ok,
+                on_error=_on_err,
+                on_progress=None,
+            )
+
+        def _wrap_throwaway_task(fn):
+            """
+            TaskManager.run_async 要求 func 必须能接收 _progress_callback / _log 两个关键字参数，
+            但高级工具里的 _work 都是纯 0 参。这里包一层，把那两个 kwargs 丢掉，再调原 fn。
+            """
+            def _inner(*, _progress_callback=None, _log=None):
+                return fn()
+            return _inner
 
         def _help(title: str, body: str) -> None:
             messagebox.showinfo(title, body, parent=dialog)
@@ -3303,7 +4315,7 @@ class Dialogs:
                 for i, (sc, p, k) in enumerate(hits[:20], 1):
                     tag = "ok" if sc == 2 else None
                     _log(f"   [{i}] {'精确' if sc == 2 else '前缀'}  {k}  {os.path.basename(p)}", tag)
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab1,
              "① SMILES 结构相似搜索",
@@ -3339,7 +4351,7 @@ class Dialogs:
                     ctl.scan_files()
                 else:
                     _log(f"⚠ 对映体生成失败：{inv_res.get('message','')}", "warn")
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab1,
              "② 手性中心识别（R/S）+ 对映体生成",
@@ -3372,7 +4384,7 @@ class Dialogs:
                     except Exception: pass
                 else:
                     _log("✖ 失败：" + r.get("message", ""), "err")
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab1,
              "③ pH 依赖质子化（-p）",
@@ -3408,7 +4420,7 @@ class Dialogs:
                     else:
                         _log(f"✖ {os.path.basename(s)} 失败：{r.get('message','')}", "err")
                 ctl.scan_files()
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         def _merge_sdf():
             files = _sel_paths()
@@ -3431,7 +4443,7 @@ class Dialogs:
                     except Exception: pass
                 else:
                     _log("✖ 失败：" + r.get("message", ""), "err")
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         frame_sdf = tk.LabelFrame(tab1, text="④ SDF 多分子文件 / 拆分 & 合并",
                                   padx=8, pady=6, font=("Microsoft YaHei UI", 10, "bold"), fg="#0f4c81")
@@ -3480,7 +4492,7 @@ class Dialogs:
                 _log(f"✅ 已生成 InChIKey {n}/{len(files)}，CSV 已保存到 {os.path.basename(csv_out)}", "ok")
                 try: _open_dir_try(csv_out)
                 except Exception: pass
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab1,
              "⑤ 批量生成 InChIKey + CSV",
@@ -3578,7 +4590,7 @@ class Dialogs:
                     except Exception: pass
                 else:
                     _log(f"✖ 失败：{r.get('error','')}", "err")
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab2,
              "① 构象搜索（OB Confab + MMFF94）→ 可选 PSI4 批量精修",
@@ -3651,7 +4663,7 @@ class Dialogs:
                     except Exception: pass
                 else:
                     _log("✖ 失败：" + r.get("error", ""), "err")
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab2,
              "② 二面角扫描 / 转动能垒（输入 4 个原子序号 + 扫描范围）",
@@ -3705,7 +4717,7 @@ class Dialogs:
                 _log(f"✅ 批量属性完成 → {out_csv}", "ok")
                 try: _open_dir_try(out_csv)
                 except Exception: pass
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab2,
              "③ 批量电子性质 / 排序表（HOMO / LUMO / GAP / 偶极）",
@@ -3758,7 +4770,7 @@ class Dialogs:
                 else:
                     _log(f"✖ IRC 失败：{r.get('error','')}", "err")
                 progress_var.set(0)
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab3,
              "① IRC 最小能量路径 + 轨迹导出",
@@ -3815,7 +4827,7 @@ class Dialogs:
                 else:
                     _log("✖ 失败：" + r.get("error", ""), "err")
                 progress_var.set(0)
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab3,
              "② R → TS → P 一键能垒图 + Eyring k(T) / t½",
@@ -3922,7 +4934,7 @@ class Dialogs:
                 else:
                     _log(f"✖ pKa 失败：{r.get('error','')}", "err")
                 progress_var.set(0)
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab4,
              "① pKa（SMD 热力学循环）预测",
@@ -3988,7 +5000,7 @@ class Dialogs:
                 else:
                     _log("✖ NMR 失败：" + r.get("error", ""), "err")
                 progress_var.set(0)
-            _in_thread(_work, done=_done)
+            _submit_work(_work, on_done=_done)
 
         _row(tab4,
              "② Boltzmann 加权 ¹H NMR 谱模拟（CPHF NMR + 构象系综）",
