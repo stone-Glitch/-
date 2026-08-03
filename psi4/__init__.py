@@ -4,7 +4,7 @@
 PSI4 计算模块 - 路由
 保持原 psi4_compute 所有函数接口不变。
 """
-from psi4.core import (
+from .core import (
     check_psi4_installed,
     check_psi4_installed_simple,
     get_preset_info,
@@ -15,13 +15,13 @@ from psi4.core import (
     parse_psi4_output,
     _run_process_with_timeout,
 )
-from psi4.scans import run_linear_scan, run_rigid_scan
-from psi4.conformer import conformer_search_ensemble
-from psi4.irc import run_irc_task, _parse_irc_trajectory_from_log
-from psi4.thermo import run_reaction_energy_profile, eyring_kinetics
-from psi4.pka import run_pka_prediction
-from psi4.nmr import run_nmr_simulation
-from psi4.utils import (
+from .scans import run_linear_scan, run_rigid_scan
+from .conformer import conformer_search_ensemble
+from .irc import run_irc_task, _parse_irc_trajectory_from_log
+from .thermo import run_reaction_energy_profile, eyring_kinetics
+from .pka import run_pka_prediction
+from .nmr import run_nmr_simulation
+from .utils import (
     _parse_xyz,
     _write_xyz,
     _lerp_coords,

@@ -12,8 +12,11 @@
   ④ 全局上下文注入：session_id / work_dir（用 LogFilter，非修改 record）
   ⑤ 🕐 performance_timer 装饰器 + 上下文管理器（ms 级），结果记 DEBUG 并累计 Top-N
   ⑥ MolManagerHandler：在不阻塞 GUI 的前提下把日志丢进 UI log_text
-"""
 
+重构说明：
+  - 移除重复的 _app_data_dir()，改用 path_utils.get_app_data_dir()
+  - 保持所有外部接口不变
+"""
 import gzip
 import io
 import json
@@ -34,6 +37,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, List, Tuple
 
+from path_utils import get_app_data_dir
 
 # GUI 依赖：如果是非 GUI 环境（cli 脚本 / 测试），不 import tkinter，
 # 但 GuiLogHandler 需要 tk.END 等常量，这里在模块开头先确定值。
@@ -48,24 +52,10 @@ except Exception:  # pragma: no cover
     _TK_AFTER = False
     _HAS_TK = False
 
-
 # ---------------- 目录 & 全局 ----------------
-def _app_data_dir() -> Path:
-    if sys.platform == 'win32':
-        base = os.environ.get('APPDATA')
-        if base:
-            d = Path(base) / "MolManager"
-        else:
-            d = Path.home() / ".mol_manager"
-    else:
-        d = Path.home() / ".mol_manager"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "logs").mkdir(parents=True, exist_ok=True)
-    return d
-
-
-APP_DATA_DIR = _app_data_dir()
+APP_DATA_DIR = get_app_data_dir()
 LOG_DIR = APP_DATA_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "mol_manager.log"
 JSON_LOG_FILE = LOG_DIR / "mol_manager.jsonl"
 
@@ -84,8 +74,9 @@ def success(self: logging.Logger, msg: object, *args: Any, **kwargs: Any) -> Non
 
 logging.Logger.success = success  # type: ignore[attr-defined]
 
-
 # ---------------- ANSI 彩色 ----------------
+
+
 class _Ansi:
     RESET   = "\033[0m"
     BOLD    = "\033[1m"
@@ -137,6 +128,8 @@ class ColorFormatter(logging.Formatter):
 
 
 # ---------------- 过期日志自动 .gz 压缩 ----------------
+
+
 class GzTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """每日切分 + 切下来的旧日志自动 gzip（节省 ~75% 磁盘）"""
 
@@ -174,6 +167,8 @@ class GzTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
 
 
 # ---------------- JSONL 格式化（支持 session_id / thread / file / line）----------------
+
+
 class JsonLinesFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         if not hasattr(record, "session_id"):
@@ -202,6 +197,7 @@ class JsonLinesFormatter(logging.Formatter):
 
 class VerboseFormatter(logging.Formatter):
     """文件 handler 用：保证 session_id 存在，避免 KeyError"""
+
     def format(self, record: logging.LogRecord) -> str:
         if not hasattr(record, "session_id"):
             try:
@@ -212,6 +208,8 @@ class VerboseFormatter(logging.Formatter):
 
 
 # ---------------- LogFilter：注入 session_id / work_dir ----------------
+
+
 class ContextFilter(logging.Filter):
     def __init__(self, state: "LoggerContext"):
         super().__init__()
@@ -223,6 +221,8 @@ class ContextFilter(logging.Filter):
 
 
 # ---------------- 全局上下文 & 性能计时 ----------------
+
+
 @dataclass
 class LoggerContext:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -256,6 +256,7 @@ def set_work_dir(path: str | os.PathLike[str]) -> None:
 
 
 # ---------- performance_timer ----------
+
 def performance_timer(name: Optional[str] = None, logger: Optional[logging.Logger] = None,
                       level: int = logging.DEBUG, min_ms: float = 1.0,
                       meta: Optional[Dict[str, Any]] = None) -> Callable[[Any], Any]:
@@ -310,6 +311,8 @@ def performance_timer(name: Optional[str] = None, logger: Optional[logging.Logge
 
 
 # ---------------- GUI 异步 Handler（避免子线程直接改 Tk widget）----------------
+
+
 class GuiLogHandler(logging.Handler):
     """
     把日志转发到 Tk Text 控件。
@@ -487,6 +490,7 @@ class GuiLogHandler(logging.Handler):
 
 
 # ---------------- 启动配置 ----------------
+
 _MAIN_LOGGER_NAME = "MolManager"
 
 
@@ -525,23 +529,19 @@ def setup_logging() -> logging.Logger:
     for h in list(root.handlers):
         root.removeHandler(h); h.close()
     root.setLevel(logging.DEBUG)
-
     root.addFilter(_CONTEXT_FILTER)
-
     # —— 问题二：日志空白修复 ——
     # 在 GUI handler 挂载之前，所有日志先存进 _STARTUP_RECORDS，等 attach_gui_handler 时批量回放。
     startup_handler = _StartupRecordCollector()
     startup_handler.setLevel(logging.DEBUG)
     startup_handler.setFormatter(VerboseFormatter(fmt="%(message)s"))
     root.addHandler(startup_handler)
-
     # 去重（同一 session 不要重复添加）
     root.addHandler(_make_console_handler())
     root.addHandler(_make_file_handler())
     jh = _make_json_handler()
     if jh is not None:
         root.addHandler(jh)
-
     logger_obj = logging.getLogger(_MAIN_LOGGER_NAME)
     logger_obj.setLevel(logging.DEBUG)
     # 启动就写 banner：方便定位 session
@@ -596,7 +596,6 @@ _GUI_HANDLER: Optional[GuiLogHandler] = None
 
 def attach_gui_handler(app_ref: Callable[[], Any]) -> GuiLogHandler:
     """给 MainView 的 log_text 挂上 live 日志输出。返回 handler 供 UI 切过滤芯片时用。
-
     同时会把 setup_logging → 此刻之间 暂存的启动日志（_STARTUP_RECORDS）批量「回放」到 handler._all_records，
     并调用一次 repaint_all，确保 UI 打开后不会是空白面板。
     """
@@ -609,7 +608,6 @@ def attach_gui_handler(app_ref: Callable[[], Any]) -> GuiLogHandler:
     handler = GuiLogHandler(app_ref)
     # 格式上 GUI 只展示 message，前缀由 on_log 自己加 tag；尽量简洁
     handler.setFormatter(logging.Formatter("%(message)s"))
-
     # —— 启动日志回放：填到 handler._all_records，再 repaint_all 一次即可渲染到 log_text ——
     startup = drain_startup_records()
     if startup:
@@ -619,10 +617,8 @@ def attach_gui_handler(app_ref: Callable[[], Any]) -> GuiLogHandler:
                 handler._all_records[:] = handler._all_records[-handler._max_records // 2:]
             # 启动日志默认也按过滤芯片可见（active 默认全 True），所以直接入 queue 也行，
             # 但更稳的是走 repaint_all（已经包含可见性过滤逻辑），因此 queue 不塞也行。
-
     logging.getLogger().addHandler(handler)
     _GUI_HANDLER = handler
-
     # —— 关键：触发一次重绘，把启动日志真正画到 log_text ——
     try:
         app = handler._resolve_app()

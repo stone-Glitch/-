@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
+from path_utils import secure_output_path, default_base_dir_from_input
 
 import logging
 from logger import default_logger as logger, performance_timer
@@ -31,6 +32,8 @@ RESOLUTIONS = {
 
 
 # ===== 安全：路径遍历封装（审计 1.1）=====
+# ---- 以下函数已统一到 path_utils 模块，此处保留向后兼容别名 ----
+
 def _secure_output_path(
     requested_path,
     *,
@@ -40,21 +43,12 @@ def _secure_output_path(
     allow_outside: bool = False,
     create_parent: bool = True,
 ) -> Path:
-    from model import resolve_secure_output_path_external
-    if base_dir is None:
-        try:
-            cwd = Path.cwd()
-            if cwd.is_dir():
-                base_dir = cwd
-            else:
-                raise RuntimeError
-        except Exception:
-            base_dir = Path(tempfile.gettempdir())
-    return resolve_secure_output_path_external(
+    """向后兼容包装：委托给 path_utils.secure_output_path"""
+    return secure_output_path(
         requested_path,
-        base_dir=base_dir,
         is_dir=is_dir,
         default_name=default_name,
+        base_dir=base_dir,
         allow_outside=allow_outside,
         create_parent=create_parent,
     )
@@ -64,33 +58,8 @@ def _default_base_dir_from_input(
     *inputs,
     fallback=None,
 ) -> Path:
-    for inp in inputs:
-        if inp is None:
-            continue
-        try:
-            p = Path(inp)
-            if p.is_dir():
-                return p.resolve()
-            if p.parent.is_dir():
-                return p.parent.resolve()
-        except Exception:
-            continue
-    if fallback is not None:
-        try:
-            pf = Path(fallback)
-            if pf.is_dir():
-                return pf.resolve()
-            if pf.parent.is_dir():
-                return pf.parent.resolve()
-        except Exception:
-            pass
-    try:
-        cwd = Path.cwd()
-        if cwd.is_dir():
-            return cwd.resolve()
-    except Exception:
-        pass
-    return Path(tempfile.gettempdir()).resolve()
+    """向后兼容包装：委托给 path_utils.default_base_dir_from_input"""
+    return default_base_dir_from_input(*inputs, fallback=fallback)
 
 
 

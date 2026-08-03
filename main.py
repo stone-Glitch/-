@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 程序入口（含启动动画）
-"""
 
+重构说明：
+  - 移除内部重复的 _is_windows_junction，改用 path_utils.is_windows_junction
+  - 保持所有外部接口不变
+"""
 import os
 import sys
 import time
@@ -11,13 +14,14 @@ import shutil
 import tempfile
 import tkinter as tk
 from pathlib import Path
+
 from logger import default_logger as logger
+from path_utils import is_windows_junction
 
 
 def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
     """
     启动时清理过期的 psi4_temp_* 临时目录，返回删除的数量。
-
     安全加固（修复 CWE-59 符号链接跟随 / CWE-367 TOCTOU / 审计 1.2 Windows junction）：
       • 仅在系统临时目录（tempfile.gettempdir / %TEMP% / TMPDIR / TMP）内匹配，
         不再触碰 Path.cwd()，避免误伤工作区或用户创建的同名目录。
@@ -30,16 +34,6 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
       • 【审计 1.2 新增】Windows 下显式检测 reparse point（junction），避免
         Path.is_symlink 漏检 NTFS reparse point。
     """
-    def _is_windows_junction(path: Path) -> bool:
-        if os.name != "nt":
-            return False
-        try:
-            st = os.lstat(os.fspath(path))
-        except OSError:
-            return False
-        import stat
-        # IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003；junction 都是 FILE_ATTRIBUTE_REPARSE_POINT
-        return bool(getattr(st, "st_file_attributes", 0) & 0x00000400)  # FILE_ATTRIBUTE_REPARSE_POINT
     removed = 0
     roots: set[Path] = set()
     for envvar in ('TMPDIR', 'TEMP', 'TMP'):
@@ -67,14 +61,14 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
         for d in candidates:
             try:
                 # 【审计 1.2 junction 检测】先在未 resolve 的路径上用 lstat
-                if _is_windows_junction(d):
+                if is_windows_junction(d):
                     continue
                 real = d.resolve(strict=True)
                 # resolve 之后如果本身是 symlink（极少，但防御），或原 path 是 symlink
                 if d.is_symlink() or real.is_symlink():
                     continue
                 # 【审计 1.2 junction 检测】resolve 后的路径也跑一遍
-                if _is_windows_junction(real):
+                if is_windows_junction(real):
                     continue
                 if real in seen:
                     continue
@@ -108,7 +102,6 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
     return removed
 
 
-
 class SplashScreen:
     """
     🫧 Aurora Frost Splash：
@@ -117,26 +110,23 @@ class SplashScreen:
       • 标题 Microsoft YaHei UI 加粗白字 + 副字紫蓝渐变
       • 底部进度 + 动态加载点
     """
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
-
         W, H = 480, 260
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - W) // 2
         y = (sh - H) // 2
         self.root.geometry(f"{W}x{H}+{x}+{y}")
-
         self.canvas = tk.Canvas(self.root, width=W, height=H, bg="#0F1733",
                                 highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-
         # —— 背景渐变：深夜 #0F1733 → 分子紫 #1B1F4B ——
         self._bg_c1 = (15, 23, 51)
         self._bg_c2 = (27, 31, 75)
         self._draw_bg()
-
         # —— 极光粒子光斑 ——
         import random
         self._rng = random.Random(42)
@@ -150,8 +140,7 @@ class SplashScreen:
                 self.canvas.create_oval(cx - r * k / 5, cy - r * k / 5,
                                         cx + r * k / 5, cy + r * k / 5,
                                         outline=col, width=0,
-                                        fill=self._mix_with_bg(col, alpha))
-
+                                        fill=self._mix_with_bg(col, alpha)))
         # —— 左侧分子轨道图（发光原子核 + 3 条椭圆轨道 + 3 个电子）——
         mx, my = 90, 130
         # 核（渐变圆：多层）
@@ -171,7 +160,6 @@ class SplashScreen:
                                            outline=col, width=2)
             # 简单近似：不真的旋转椭圆，用 canvas 画点模拟电子沿轨道
             self._orbit_items.append((mx, my, rx, ry, rot, col, idx))
-
         # —— 标题 ——
         self.canvas.create_text(210, 95, anchor="w",
                                 text="分子与计算文件管理器",
@@ -184,7 +172,6 @@ class SplashScreen:
                                 text="  🫧  Aurora Frost   ·   分子文件 · QM · 动画 · 工具箱",
                                 fill="#B7CCFF",
                                 font=("Microsoft YaHei UI", 10))
-
         # —— 底部状态文字 / 进度点 ——
         self.status_lbl = self.canvas.create_text(210, 195, anchor="w",
                                                    text="正在初始化…",
@@ -198,7 +185,6 @@ class SplashScreen:
                                                             outline="#2A3067", fill="#1A224F")
         self.progress_bar = self.canvas.create_rectangle(210, 232, 210, 240,
                                                          outline="", fill="#0EA288")
-
         self.anim_running = True
         self._after_ids: list[str] = []
         self._t0 = 0
@@ -245,8 +231,10 @@ class SplashScreen:
     def close(self):
         self.anim_running = False
         for a in self._after_ids:
-            try: self.root.after_cancel(a)
-            except Exception: pass
+            try:
+                self.root.after_cancel(a)
+            except Exception:
+                pass
         self.root.destroy()
 
 
@@ -260,6 +248,7 @@ def main():
         _th.Thread(target=_cleanup_stale_tempdirs, daemon=False, name="TmpCleanup").start()
     except Exception as e:
         logger.debug("启动临时目录清理线程失败（将跳过清理）: %s", e)
+
     splash = SplashScreen()
 
     def _close_splash_safely():
@@ -371,8 +360,8 @@ def main():
                 if fallback_tb:
                     print("---- traceback ----", file=sys.stderr)
                     print(fallback_tb, file=sys.stderr)
-                print(f"(messagebox 不可用: {_mb_err})", file=sys.stderr)
-                print("=" * 60, file=sys.stderr)
+                    print(f"(messagebox 不可用: {_mb_err})", file=sys.stderr)
+                    print("=" * 60, file=sys.stderr)
             except Exception:
                 pass
 

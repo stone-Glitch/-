@@ -13,6 +13,8 @@ Model - 核心业务逻辑
   4. export_missing_csv / import_mapping_csv 增加 base_dir 限制，
      rename_by_mapping / organize_by_type / delete_files 增加 symlink / junction 拒绝。
   5. 【新增】多线程并发保护：mapping、_reverse_mapping、_scan_cache 使用 RLock 保护。
+  6. 【重构】resolve_secure_output_path_external 简化为对 path_utils.resolve_secure_output_path 的委托，
+     消除代码重复。
 """
 import os
 import re
@@ -27,8 +29,18 @@ from typing import List, Dict, Optional, Tuple
 
 from logger import default_logger as logger
 from constants import SUPPORTED_EXTS
+from path_utils import (
+    is_windows_junction,
+    enforce_no_symlink_target,
+    resolve_secure_output_path,
+)
 import openbabel_utils as ob_utils
 import psi4_compute as psi4_utils
+
+# ---- 向后兼容别名（原 model 模块级函数，现已统一到 path_utils）----
+# 保留旧函数名，确保外部导入（如 psi4_compute / reaction_animation）不报错
+_is_windows_junction = is_windows_junction
+# resolve_secure_output_path_external 将在文件末尾委托给 path_utils
 
 
 class MolManagerModel:
@@ -433,46 +445,12 @@ class MolManagerModel:
         return final_path
 
 
-def enforce_no_symlink_target(
-    path: str | os.PathLike,
-    *,
-    allow_nonexistent: bool = True,
-    _level: str = "leaf",
-) -> None:
-    p = Path(path)
-    if not p.exists() and allow_nonexistent:
-        return
-    try:
-        if p.is_symlink():
-            raise ValueError(f"检测到符号链接（symlink），拒绝操作: {os.fspath(p)!r}")
-    except OSError as exc:
-        raise ValueError(f"无法判定是否为符号链接: {os.fspath(p)!r} ({exc})") from exc
-    if os.name == "nt":
-        _is_windows_junction(p, _raise=True)
-    return
-
+# ---- 以下函数已统一到 path_utils 模块，此处保留向后兼容别名 ----
+# enforce_no_symlink_target 已在文件开头从 path_utils 导入
 
 def _is_windows_junction(path: str | os.PathLike, *, _raise: bool = False) -> bool:
-    if os.name != "nt":
-        return False
-    try:
-        p = Path(path)
-        if not p.exists():
-            return False
-        try:
-            st = os.lstat(p)
-        except OSError:
-            return False
-        FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-        if (st.st_mode & stat.S_IFMT) == stat.S_IFDIR and (st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT):
-            if _raise:
-                raise ValueError(f"检测到 Windows Junction / ReparsePoint 目录，拒绝跟随操作: {os.fspath(p)!r}")
-            return True
-    except ValueError:
-        raise
-    except Exception:
-        return False
-    return False
+    """向后兼容包装：参数名 _raise → raise_on_junction"""
+    return is_windows_junction(path, raise_on_junction=_raise)
 
 
 def resolve_secure_output_path_external(
@@ -484,91 +462,20 @@ def resolve_secure_output_path_external(
     allow_outside: bool = False,
     create_parent: bool = False,
 ) -> Path:
-    if not base_dir:
-        raise ValueError("base_dir 不能为空")
-    base_p = Path(base_dir)
-    if not base_p.is_dir():
-        raise ValueError(f"base_dir 必须是已存在的目录: {os.fspath(base_p)!r}")
-    base_real = base_p.resolve(strict=True)
-
-    raw = ""
-    if requested_path is None:
-        raw = ""
-    elif isinstance(requested_path, bytes):
-        raw = requested_path.decode("utf-8", "replace")
-    else:
-        raw = os.fspath(requested_path)
-    raw = raw.strip() if isinstance(raw, str) else ""
-    if not raw and default_name:
-        raw = str(default_name)
-    if not raw:
-        raise ValueError("输出路径为空且未提供 default_name")
-
-    raw_slashed = raw.replace("\\", "/")
-    raw_segs = [s for s in raw_slashed.split("/") if s != ""]
-    if any(seg == ".." for seg in raw_segs):
-        raise ValueError(f"输出路径禁止包含 '..' 段: {raw!r}")
-
-    p = Path(raw)
-    if not p.is_absolute():
-        p = base_real / p
-
-    norm_abs = os.path.normpath(os.fspath(p))
-    base_norm = os.path.normpath(os.fspath(base_real))
-    if not allow_outside:
-        try:
-            common = os.path.commonpath([base_norm, norm_abs])
-            if os.path.normcase(common) != os.path.normcase(base_norm):
-                raise ValueError(
-                    f"输出路径越出允许范围（commonpath 判定）：请求 {norm_abs!r}，允许根 {base_norm!r}"
-                )
-        except (OSError, ValueError) as exc:
-            if isinstance(exc, ValueError):
-                raise
-            raise ValueError(f"输出路径规范化失败: {raw!r}") from exc
-    cand = Path(norm_abs)
-
-    def _walk_chain(target: Path, base: Path) -> None:
-        try:
-            rel = target.resolve(strict=False).relative_to(base.resolve(strict=False))
-            parts_a = list(rel.parts)
-        except (OSError, ValueError):
-            parts_a = list(target.parts)
-        cur = base
-        for part in parts_a:
-            cur = cur / part
-            if not cur.exists():
-                continue
-            enforce_no_symlink_target(cur, allow_nonexistent=True, _level="chain")
-        if target.exists():
-            enforce_no_symlink_target(target, allow_nonexistent=True, _level="leaf")
-
-    try:
-        _walk_chain(cand, base_real)
-    except ValueError as exc:
-        raise ValueError(f"输出路径链中存在符号链接 / Junction，拒绝写入: {raw!r} ({exc})") from exc
-    if not allow_outside:
-        try:
-            if cand.exists() or cand.parent.exists():
-                resolved = cand.resolve(strict=False)
-            else:
-                resolved = cand
-            resolved.relative_to(base_real)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"解析后真实路径超出允许范围（含 symlink 穿透）: {raw!r}") from exc
-    if create_parent:
-        parent = cand if is_dir else cand.parent
-        try:
-            if not allow_outside:
-                _ = Path(os.path.normpath(os.fspath(parent))).relative_to(
-                    Path(os.path.normpath(os.fspath(base_real))))
-            parent.mkdir(parents=True, exist_ok=True)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"无法为输出路径创建父目录: {os.fspath(cand)!r} ({exc})") from exc
-    return cand
+    """
+    向后兼容包装：直接委托给 path_utils.resolve_secure_output_path
+    """
+    return resolve_secure_output_path(
+        requested_path,
+        base_dir=base_dir,
+        is_dir=is_dir,
+        default_name=default_name,
+        allow_outside=allow_outside,
+        create_parent=create_parent,
+    )
 
 
-# ---------- 命名修复 ----------
+    # ---------- 命名修复 ----------
     def _plan_rename(self, file_entry, new_base: str | None, skip_reason: str | None = None):
         if skip_reason is not None:
             return ('skip', skip_reason)

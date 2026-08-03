@@ -2,40 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 配置管理模块
+
+重构说明：
+  - 移除重复的 _app_data_dir() / _chmod_quiet()，改用 path_utils 中的统一实现
+  - 保持所有外部接口不变
 """
 import json
 import os
-import sys
 from pathlib import Path
+
 from logger import default_logger as logger
+from path_utils import get_app_data_dir, chmod_quiet
 
-
-def _chmod_quiet(p: Path, mode: int) -> None:
-    try:
-        if hasattr(os, 'chmod'):
-            os.chmod(p, mode)
-    except OSError:
-        # Windows 对某些路径可能拒绝 chmod，静默跳过（ACL 仍有效）
-        pass
-
-
-def _app_data_dir() -> Path:
-    if sys.platform == 'win32':
-        base = os.environ.get('APPDATA')
-        if base:
-            d = Path(base) / "MolManager"
-        else:
-            d = Path.home() / ".mol_manager"
-    else:
-        d = Path.home() / ".mol_manager"
-    d.mkdir(parents=True, exist_ok=True)
-    # M-3 / CWE-732 修复：仅当前用户可读取/进入该目录，防止同机其他用户嗅探
-    _chmod_quiet(d, 0o700)
-    return d
-
-
-APP_DATA_DIR = _app_data_dir()
+APP_DATA_DIR = get_app_data_dir()
 CONFIG_FILE = APP_DATA_DIR / "mol_manager_config.json"
+
 DEFAULT_CONFIG = {
     "work_dir": "output",
     "mapping_file": "",
@@ -63,7 +44,9 @@ DEFAULT_CONFIG = {
     # first_run 由 wizard.py 管理
     "first_run": True,
 }
+
 MAX_RECENT_DIRS = 10
+
 
 def _deep_merge(target: dict, defaults: dict) -> dict:
     """递归合并 defaults 到 target（target 中的键优先），返回 target。"""
@@ -83,7 +66,7 @@ def load_config():
     try:
         if CONFIG_FILE.exists():
             # 先补一次权限（兼容旧版本创建的 0o644 文件）
-            _chmod_quiet(CONFIG_FILE, 0o600)
+            chmod_quiet(CONFIG_FILE, 0o600)
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 if not isinstance(config, dict):
@@ -94,6 +77,7 @@ def load_config():
         logger.warning("加载配置文件失败，使用默认配置: %s", e)
     return DEFAULT_CONFIG.copy()
 
+
 def save_config(config):
     tmp_path: Path | None = None
     try:
@@ -103,12 +87,12 @@ def save_config(config):
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         # 先 chmod 再原子替换，防止竞态
-        _chmod_quiet(tmp_path, 0o600)
+        chmod_quiet(tmp_path, 0o600)
         if hasattr(os, 'replace'):
             os.replace(tmp_path, CONFIG_FILE)
         else:
             tmp_path.rename(CONFIG_FILE)
-        _chmod_quiet(CONFIG_FILE, 0o600)
+        chmod_quiet(CONFIG_FILE, 0o600)
     except OSError as e:
         logger.warning("保存配置文件失败: %s", e)
     finally:
