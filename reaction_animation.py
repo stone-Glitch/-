@@ -1064,5 +1064,62 @@ def generate_reaction_animation(
                 logger.debug("清理 frames_root 临时目录失败: %s", _cleanup_err)
 
 
-__all__ = ["generate_reaction_animation", "generate_xyz_trajectory",
-           "generate_reaction_multispecies", "RESOLUTIONS", "PIL_AVAILABLE"]
+# ========== 新增：预览第一帧 ==========
+@performance_timer(name="ra.preview_first_frame", level=logging.DEBUG, min_ms=50.0)
+def preview_first_frame(
+    reactant_xyz: str | os.PathLike[str],
+    product_xyz: str | os.PathLike[str],
+    output_png: str | os.PathLike[str],
+    *,
+    width: int = 640,
+    height: int = 480,
+    translate_spacing: float = 5.0,
+) -> dict[str, Any]:
+    """
+    快速预览第一帧（反应物结构），用于调参后立即查看效果。
+    返回 {'success': bool, 'output': str, 'error': str}
+    """
+    result = {"success": False, "output": None, "error": None}
+    try:
+        import tempfile
+        r_p = Path(reactant_xyz)
+        p_p = Path(product_xyz)
+        if not r_p.exists() or not p_p.exists():
+            raise FileNotFoundError("反应物或产物文件不存在")
+        n_r, atoms_r, R = _parse_xyz(r_p.read_text(encoding="utf-8"))
+        n_p, atoms_p, P = _parse_xyz(p_p.read_text(encoding="utf-8"))
+        # 若顺序不一致，尝试自动对齐（仅针对单分子）
+        if n_r != n_p or atoms_r != atoms_p:
+            # 尝试用 _auto_reorder_atoms 对齐（需要合并再拆分，这里简化）
+            # 更简单：直接报错，让用户知道
+            raise ValueError("反应物和产物原子顺序/数量不一致，请先对齐")
+        # 只取 t=0（反应物）
+        coords = _lerp_coords(R, P, 0.0)
+        xyz_text = _write_xyz(n_r, atoms_r, coords)
+
+        with tempfile.NamedTemporaryFile(suffix=".xyz", delete=False) as tmp:
+            tmp.write(xyz_text.encode("utf-8"))
+            tmp_path = tmp.name
+        try:
+            import openbabel_utils as obu
+            r = obu.render_png_2d(tmp_path, str(output_png), width, height)
+            if r.get("success"):
+                result["success"] = True
+                result["output"] = str(output_png)
+            else:
+                result["error"] = r.get("message", "渲染失败")
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+__all__ = [
+    "generate_reaction_animation",
+    "generate_xyz_trajectory",
+    "generate_reaction_multispecies",
+    "RESOLUTIONS",
+    "PIL_AVAILABLE",
+    "preview_first_frame",
+]

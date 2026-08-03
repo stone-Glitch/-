@@ -56,6 +56,10 @@ DEFAULT_CONFIG = {
     # === 三、OpenBabel 识别失败：用户可手动指定 obabel 可执行文件路径（绝对路径）===
     # 空串 = 自动查找（PATH / shutil.which / 常见安装位置）
     "obabel_path": "",
+    # === 易用性改进新增字段 ===
+    "ui_mode": "simple",                # simple / advanced
+    "recent_files": [],                 # 最近使用的文件路径列表（最多10个）
+    "preset_auto_load": "",             # 自动加载的预设名（空表示不自动加载）
     # first_run 由 wizard.py 管理
     "first_run": True,
 }

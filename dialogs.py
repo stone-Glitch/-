@@ -4,6 +4,7 @@
 对话框模块 - 文件类型选择、PSI4 计算、OpenBabel 工具
 修复：返回值解包、进度回调传递、子线程 UI 操作必须走 after(0)
 """
+
 import os
 import sys
 import csv
@@ -19,6 +20,7 @@ from pathlib import Path
 from logger import default_logger as logger
 from constants import PSI4_PRESETS, PSI4_TASKS, SUPPORTED_EXTS, RUN_PRESETS
 import openbabel_utils as ob_utils
+from preset_manager import get_preset_manager  # 新增
 
 
 # ===== dialogs 级临时目录跟踪 + atexit 兜底清理 =====
@@ -244,6 +246,26 @@ class Dialogs:
         if "ffmpeg" in lower:
             return ("没检测到 ffmpeg 😟", "导出 MP4 需要 ffmpeg",
                     "👉 安装后再导出 MP4；GIF 不需要 ffmpeg 可以直接生成")
+
+        # === 新增：易用性相关错误 ===
+        if "原子顺序不一致" in msg or "原子对齐" in msg:
+            return (
+                "分子对不上哦 😅",
+                "反应物和产物的原子种类或数量不一致，无法自动生成动画。",
+                "👉 试试：\n  ① 检查反应物和产物的原子数是否相同\n  ② 使用「自动对齐」功能（高级模式）\n  ③ 确保原子顺序一致（如 C 原子都在前面）"
+            )
+        if "至少提供" in msg and "反应物" in msg:
+            return (
+                "还差一点 😅",
+                "需要至少 1 个反应物和 1 个产物才能生成动画。",
+                "👉 从主文件列表里选几个分子，或点「常见反应模板」一键填充！"
+            )
+        if "Pillow" in msg or "PIL" in msg:
+            return (
+                "图片库没装 😟",
+                "生成动画 GIF / PNG 需要 Pillow 图像库。",
+                "👉 在终端执行：\n  pip install Pillow\n  或\n  conda install pillow"
+            )
 
         # === 兜底 ===
         title = "出了点小问题"
@@ -1209,7 +1231,7 @@ class Dialogs:
         ttk.Button(ref_btn_col, text="添加...", command=add_ref_files).pack(side=tk.TOP, pady=2, fill=tk.X)
         ttk.Button(ref_btn_col, text="删除选中", command=del_ref_selected).pack(side=tk.TOP, pady=2, fill=tk.X)
 
-        ttk.Label(tab_align, text="移动分子（多选）:").grid(row=2, column=0, sticky="nw", pady=(10, 0))
+        ttk.Label(tab_align, text="移动分子（多选）:").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
 
         mob_list_frame = ttk.Frame(tab_align)
         mob_list_frame.grid(row=2, column=1, padx=5, sticky="nsew", pady=(10, 0))
@@ -2342,15 +2364,17 @@ class Dialogs:
         btn_frame.grid_columnconfigure(1, weight=1)
 
         ttk.Button(dialog, text="关闭", command=dialog.destroy, width=20).pack(pady=20)
-
+    # ============ 反应动画对话框（完整版，含模式切换、预设管理、预览、高级参数折叠） ============
     def show_reaction_animation_dialog(self):
         import reaction_animation as ra
         import shutil as _shutil
         import subprocess as _sp
+        from preset_manager import get_preset_manager
+        import tempfile
 
         dialog = tk.Toplevel(self.app)
         dialog.title("🎬 制作反应动画（含 IQmol 可播放轨迹 · 支持多反应物+多产物）")
-        dialog.geometry("900x820")
+        dialog.geometry("950x880")
         dialog.transient(self.app)
         try:
             dialog.grab_set()
@@ -2359,56 +2383,187 @@ class Dialogs:
 
         pad = {"padx": 12, "pady": 4}
 
-        def _browse_open(store_var, title, filters):
-            init = str(self.controller.model.work_dir)
-            f = filedialog.askopenfilename(parent=dialog, initialdir=init, title=title, filetypes=filters)
-            if f:
-                store_var.set(f)
+        # ---------- 模式切换 ----------
+        mode_frame = ttk.Frame(dialog)
+        mode_frame.pack(fill=tk.X, padx=12, pady=6)
 
-        def _browse_open_multi(listbox):
-            init = str(self.controller.model.work_dir)
-            fs = filedialog.askopenfilenames(parent=dialog, initialdir=init,
-                title="选择分子文件（可多选）",
-                filetypes=[("分子文件", "*.xyz *.mol *.sdf *.mol2"), ("所有文件", "*.*")])
-            if fs:
-                for f in fs:
-                    self._ra_add_unique_path(listbox, f)
+        mode_var = tk.StringVar(value=self.app.config_data.get("ui_mode", "simple"))
+        simple_btn = ttk.Radiobutton(mode_frame, text="🌟 简单模式（推荐）",
+                                      variable=mode_var, value="simple",
+                                      command=lambda: _toggle_mode("simple"))
+        adv_btn = ttk.Radiobutton(mode_frame, text="🔧 高级模式",
+                                   variable=mode_var, value="advanced",
+                                   command=lambda: _toggle_mode("advanced"))
+        simple_btn.pack(side=tk.LEFT, padx=4)
+        adv_btn.pack(side=tk.LEFT, padx=4)
 
-        def _browse_save(store_var, title, ext, filters):
-            init = str(self.controller.model.work_dir)
-            f = filedialog.asksaveasfilename(parent=dialog, initialdir=init, title=title,
-                defaultextension=ext, filetypes=filters)
-            if f:
-                store_var.set(f)
+        mode_tip = ttk.Label(mode_frame, text="💡 简单模式只显示核心参数，高级选项已隐藏",
+                             foreground="#3B6EFF")
+        mode_tip.pack(side=tk.LEFT, padx=10)
 
-        csv_var = tk.StringVar()
-        ffmpeg_var = tk.StringVar(value="ffmpeg")
+        # ---------- 预设管理 ----------
+        pm = get_preset_manager()
+        preset_frame = ttk.LabelFrame(dialog, text="📁 预设管理", padding="6")
+        preset_frame.pack(fill=tk.X, padx=12, pady=(6, 4))
 
-        out_var = tk.StringVar(value=str(self.controller.model.work_dir / "reaction_animation.gif"))
-        traj_var = tk.StringVar(value=str(self.controller.model.work_dir / "reaction_trajectory.xyz"))
-        traj_fmt_var = tk.StringVar(value="xyz")
-        iqmol_path_var = tk.StringVar(value="IQmol")
-        auto_open_iqmol_var = tk.BooleanVar(value=False)
-        gen_traj_var = tk.BooleanVar(value=True)
+        preset_var = tk.StringVar()
+        preset_combo = ttk.Combobox(preset_frame, textvariable=preset_var,
+                                    values=pm.list_presets(), state="readonly", width=20)
+        preset_combo.pack(side=tk.LEFT, padx=4)
 
-        header = ttk.Label(dialog,
-            text="① 选择反应物/产物（**可多选**，多反应物 + 多产物自动沿 X 轴平移拼接）\n"
-                 "  💡 新手快用：直接点下面 「常见反应模板」 按钮一键填好！\n"
-                 "② 可视化：GIF / MP4 / PNG 帧目录（可 none）\n"
-                 "③ IQmol：输出多帧 XYZ / SDF 轨迹，打开自动进入 Animation 播放（支持能量列）",
-            foreground='#1f6feb', font=('Microsoft YaHei', 10, 'bold'), wraplength=860, justify='left')
-        header.pack(padx=12, pady=(12, 6), anchor='w')
+        def _load_preset():
+            name = preset_var.get()
+            if not name:
+                return
+            data = pm.get_preset(name)
+            if not data:
+                return
+            try:
+                if "fps" in data: fps_var.set(data["fps"])
+                if "steps" in data: steps_var.set(data["steps"])
+                if "mode" in data: mode_var.set(data["mode"])
+                if "fmt" in data: fmt_var.set(data["fmt"])
+                if "resolution" in data: res_var.set(data["resolution"])
+                if "smooth" in data: smooth_var.set(data["smooth"])
+                if "spacing" in data: spacing_var.set(data["spacing"])
+                if "reactants" in data:
+                    r_list.delete(0, tk.END)
+                    for p in data["reactants"]:
+                        if Path(p).exists():
+                            r_list.insert(tk.END, p)
+                if "products" in data:
+                    p_list.delete(0, tk.END)
+                    for p in data["products"]:
+                        if Path(p).exists():
+                            p_list.insert(tk.END, p)
+                if "solvent" in data:
+                    solvent_var.set(data["solvent"])
+                if "qm_method" in data:
+                    qm_method_var.set(data["qm_method"])
+                if "qm_basis" in data:
+                    qm_basis_var.set(data["qm_basis"])
+                if "qm_d3" in data:
+                    qm_d3_var.set(data["qm_d3"])
+                if "qm_charge" in data:
+                    qm_charge_var.set(data["qm_charge"])
+                if "qm_mult" in data:
+                    qm_mult_var.set(data["qm_mult"])
+                if "qm_mem" in data:
+                    qm_mem_var.set(data["qm_mem"])
+                if "scan_steps" in data:
+                    scan_steps_var.set(data["scan_steps"])
+                if "scan_output" in data:
+                    scan_output_var.set(data["scan_output"])
+                if "trajectory_format" in data:
+                    traj_fmt_var.set(data["trajectory_format"])
+                if "iqmol_path" in data:
+                    iqmol_path_var.set(data["iqmol_path"])
+                if "auto_open_iqmol" in data:
+                    auto_open_iqmol_var.set(data["auto_open_iqmol"])
+                if "gen_traj" in data:
+                    gen_traj_var.set(data["gen_traj"])
+                if "out_path" in data:
+                    out_var.set(data["out_path"])
+                if "traj_path" in data:
+                    traj_var.set(data["traj_path"])
+                messagebox.showinfo("加载成功", f"已加载预设：{name}", parent=dialog)
+            except Exception as e:
+                messagebox.showerror("加载失败", str(e), parent=dialog)
 
-        # ============ ✨ UX-4：常见反应模板（新手一键填） ============
+        def _save_preset():
+            name = simpledialog.askstring("保存预设", "输入预设名称：", parent=dialog)
+            if not name:
+                return
+            data = {
+                "fps": fps_var.get(),
+                "steps": steps_var.get(),
+                "mode": mode_var.get(),
+                "fmt": fmt_var.get(),
+                "resolution": res_var.get(),
+                "smooth": smooth_var.get(),
+                "spacing": spacing_var.get(),
+                "reactants": [r_list.get(i) for i in range(r_list.size())],
+                "products": [p_list.get(i) for i in range(p_list.size())],
+                "solvent": solvent_var.get(),
+                "qm_method": qm_method_var.get(),
+                "qm_basis": qm_basis_var.get(),
+                "qm_d3": qm_d3_var.get(),
+                "qm_charge": qm_charge_var.get(),
+                "qm_mult": qm_mult_var.get(),
+                "qm_mem": qm_mem_var.get(),
+                "scan_steps": scan_steps_var.get(),
+                "scan_output": scan_output_var.get(),
+                "trajectory_format": traj_fmt_var.get(),
+                "iqmol_path": iqmol_path_var.get(),
+                "auto_open_iqmol": auto_open_iqmol_var.get(),
+                "gen_traj": gen_traj_var.get(),
+                "out_path": out_var.get(),
+                "traj_path": traj_var.get(),
+            }
+            if pm.save_preset(name, data):
+                preset_combo["values"] = pm.list_presets()
+                preset_var.set(name)
+                messagebox.showinfo("保存成功", f"预设 '{name}' 已保存", parent=dialog)
+            else:
+                messagebox.showerror("保存失败", "无法保存预设", parent=dialog)
+
+        def _delete_preset():
+            name = preset_var.get()
+            if not name:
+                return
+            if messagebox.askyesno("确认删除", f"确定删除预设 '{name}' 吗？", parent=dialog):
+                if pm.delete_preset(name):
+                    preset_combo["values"] = pm.list_presets()
+                    preset_var.set("")
+                    messagebox.showinfo("已删除", f"预设 '{name}' 已删除", parent=dialog)
+                else:
+                    messagebox.showerror("删除失败", "删除预设失败", parent=dialog)
+
+        def _export_preset():
+            name = preset_var.get()
+            if not name:
+                return
+            export_path = filedialog.asksaveasfilename(
+                title="导出预设为 JSON",
+                defaultextension=".json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                parent=dialog
+            )
+            if export_path:
+                if pm.export_preset(name, export_path):
+                    messagebox.showinfo("导出成功", f"预设已导出到：{export_path}", parent=dialog)
+                else:
+                    messagebox.showerror("导出失败", "导出预设失败", parent=dialog)
+
+        def _import_preset():
+            import_path = filedialog.askopenfilename(
+                title="导入预设 JSON 文件",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                parent=dialog
+            )
+            if import_path:
+                try:
+                    name, data = pm.import_preset(import_path)
+                    preset_combo["values"] = pm.list_presets()
+                    preset_var.set(name)
+                    messagebox.showinfo("导入成功", f"已导入预设：{name}", parent=dialog)
+                except Exception as e:
+                    messagebox.showerror("导入失败", str(e), parent=dialog)
+
+        ttk.Button(preset_frame, text="📥 加载", command=_load_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_frame, text="💾 保存", command=_save_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_frame, text="🗑️ 删除", command=_delete_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_frame, text="📤 导出", command=_export_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_frame, text="📥 导入", command=_import_preset).pack(side=tk.LEFT, padx=2)
+
+        # ---------- 常见反应模板 ----------
         tpl_frame = ttk.LabelFrame(dialog, text="✨ 常见反应模板（点一下自动填好反应物和产物）", padding=8)
         tpl_frame.pack(fill='x', padx=12, pady=(0, 4))
         tpl_hint = ttk.Label(tpl_frame, text="如果工作目录里有同名 .xyz 就用你的，没有就用内置分子坐标", foreground="#666666")
         tpl_hint.pack(anchor='w', padx=4, pady=(0, 4))
-        tpl_btn_row = ttk.Frame(tpl_frame); tpl_btn_row.pack(fill='x')
 
         # 内置常见反应的 SMILES 式分子（OpenBabel 转 xyz；没有 OB 就手写最小 xyz）
         BUILTIN_XYZ: dict[str, tuple[int, list[str], list[list[float]]]] = {
-            # CH4 甲烷：四面体
             "ch4": (5, ["C", "H", "H", "H", "H"], [
                 [0.00000, 0.00000, 0.00000],
                 [0.62912, 0.62912, 0.62912],
@@ -2416,11 +2571,8 @@ class Dialogs:
                 [-0.62912, 0.62912, -0.62912],
                 [0.62912, -0.62912, -0.62912],
             ]),
-            # Cl2 氯气
             "cl2": (2, ["Cl", "Cl"], [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
-            # HCl 氯化氢
             "hcl": (2, ["H", "Cl"], [[0.0, 0.0, 0.0], [1.28, 0.0, 0.0]]),
-            # CH3Cl 一氯甲烷
             "ch3cl": (5, ["C", "Cl", "H", "H", "H"], [
                 [0.00000, 0.00000, 0.00000],
                 [1.78000, 0.00000, 0.00000],
@@ -2428,24 +2580,17 @@ class Dialogs:
                 [-0.35700, -0.52000, 0.88600],
                 [-0.35700, -0.52000, -0.88600],
             ]),
-            # H2 氢气
             "h2": (2, ["H", "H"], [[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]]),
-            # H2O 水
             "h2o": (3, ["O", "H", "H"], [[0.0, 0.0, 0.0], [0.957, 0.0, 0.0], [-0.239, 0.927, 0.0]]),
-            # O2 氧气
             "o2": (2, ["O", "O"], [[0.0, 0.0, 0.0], [1.21, 0.0, 0.0]]),
-            # CO2 二氧化碳
             "co2": (3, ["C", "O", "O"], [[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]]),
-            # N2 氮气
             "n2": (2, ["N", "N"], [[0.0, 0.0, 0.0], [1.098, 0.0, 0.0]]),
-            # NH3 氨
             "nh3": (4, ["N", "H", "H", "H"], [
                 [0.00000, 0.00000, 0.00000],
                 [0.93770, 0.00000, 0.36690],
                 [-0.46890, 0.81200, 0.36690],
                 [-0.46890, -0.81200, 0.36690],
             ]),
-            # CH3OH 甲醇
             "ch3oh": (6, ["C", "O", "H", "H", "H", "H"], [
                 [0.74410, 0.00000, 0.00000],
                 [-0.68660, 0.00000, 0.00000],
@@ -2454,7 +2599,6 @@ class Dialogs:
                 [1.10690, -0.50210, -0.92740],
                 [-1.07800, 0.81090, 0.00000],
             ]),
-            # C2H4 乙烯
             "c2h4": (6, ["C", "C", "H", "H", "H", "H"], [
                 [0.66950, 0.00000, 0.00000],
                 [-0.66950, 0.00000, 0.00000],
@@ -2463,7 +2607,6 @@ class Dialogs:
                 [-1.24000, 0.92890, 0.00000],
                 [-1.24000, -0.92890, 0.00000],
             ]),
-            # C2H6 乙烷
             "c2h6": (8, ["C", "C", "H", "H", "H", "H", "H", "H"], [
                 [0.76440, 0.00000, 0.00000],
                 [-0.76440, 0.00000, 0.00000],
@@ -2477,20 +2620,17 @@ class Dialogs:
         }
 
         def _resolve_or_build(name: str, tmpdir: Path) -> str:
-            """先在工作目录找同名 .xyz，找不到就写一份内置坐标到 tmpdir，返回路径"""
             workdir = Path(self.controller.model.work_dir)
             candidate = workdir / f"{name}.xyz"
             if candidate.exists():
                 return str(candidate)
-            # 尝试 .mol
             candidate2 = workdir / f"{name}.mol"
             if candidate2.exists():
                 return str(candidate2)
-            # 生成内置 xyz
             if name not in BUILTIN_XYZ:
-                return str(candidate)  # 不存在会被下游正确报错
+                return str(candidate)
             n, syms, coords = BUILTIN_XYZ[name]
-            lines: list[str] = [str(n), "", ]
+            lines: list[str] = [str(n), ""]
             for s, (x, y, z) in zip(syms, coords):
                 lines.append(f"{s:2s} {x:12.6f} {y:12.6f} {z:12.6f}")
             p = tmpdir / f"tpl_{name}.xyz"
@@ -2500,19 +2640,15 @@ class Dialogs:
         def _apply_template(r_names: list[str], p_names: list[str], def_solvent: str | None = None):
             import tempfile
             import shutil as _shu
-            r_list.delete(0, tk.END); p_list.delete(0, tk.END)
+            r_list.delete(0, tk.END)
+            p_list.delete(0, tk.END)
 
-            # M-1 修复：用集合记录本对话框整个生命周期内所有模板创建过的临时目录，
-            # 不再只记录「最后一个」；WM_DELETE_WINDOW / <Destroy> 事件 / atexit 三条路径
-            # 都会对整个集合一次性清理，避免用户疯狂切换模板时早期目录残留到 atexit 才清。
             tpl_dirs: set[Path] | None = getattr(dialog, "_ra_tpl_dirs", None)
             if tpl_dirs is None:
                 tpl_dirs = set()
-                dialog._ra_tpl_dirs = tpl_dirs  # type: ignore[attr-defined]
+                dialog._ra_tpl_dirs = tpl_dirs
 
                 def _cleanup_all_tpl_dirs() -> None:
-                    """清理集合中所有仍存在的 ra_tpl_ 临时目录；幂等，重复调用无害。"""
-                    # 从 dialog 上摘下集合，避免 <Destroy> 和 WM_DELETE_WINDOW 各自执行时重复。
                     ds: set[Path] = getattr(dialog, "_ra_tpl_dirs", None) or set()
                     try:
                         delattr(dialog, "_ra_tpl_dirs")
@@ -2526,19 +2662,9 @@ class Dialogs:
                             unregister_dialog_temp_dir(p_)
                         except Exception:
                             pass
+                dialog.protocol("WM_DELETE_WINDOW", lambda: (_cleanup_all_tpl_dirs(), dialog.destroy()))
+                dialog.bind("<Destroy>", lambda event: _cleanup_all_tpl_dirs() if event.widget is dialog else None)
 
-                # (1) 窗口系统菜单 / 关闭按钮走 protocol
-                dialog.protocol("WM_DELETE_WINDOW", lambda: (_cleanup_all_tpl_dirs(), dialog.destroy()))  # type: ignore[arg-type,return-value]
-
-                # (2) 代码里调用 dialog.destroy()（比如 OK/Cancel 按钮）走 <Destroy> 事件；
-                #     Tk 的 <Destroy> 对子控件也会触发，必须判断 widget 是顶层 dialog 自己。
-                def _on_dialog_destroy(event):
-                    if event.widget is not dialog:
-                        return
-                    _cleanup_all_tpl_dirs()
-                dialog.bind("<Destroy>", _on_dialog_destroy)
-
-            # 先清理上一次模板目录（切换模板时立即释放，不等到对话框关闭）
             _prev = getattr(dialog, "_ra_tpl_last", None)
             if _prev is not None:
                 try:
@@ -2549,12 +2675,12 @@ class Dialogs:
                     tpl_dirs.discard(_pp)
                 except Exception:
                     pass
-                dialog._ra_tpl_last = None  # type: ignore[attr-defined]
+                dialog._ra_tpl_last = None
 
             td = Path(tempfile.mkdtemp(prefix="ra_tpl_"))
             register_dialog_temp_dir(td)
             tpl_dirs.add(td)
-            dialog._ra_tpl_last = td  # type: ignore[attr-defined]  # 供下次切换模板时及时清理上一个
+            dialog._ra_tpl_last = td
 
             for n in r_names:
                 self._ra_add_unique_path(r_list, _resolve_or_build(n, td))
@@ -2563,7 +2689,8 @@ class Dialogs:
             if def_solvent is not None:
                 for k in SOLVENT_CHOICES:
                     if k.startswith(def_solvent + " "):
-                        solvent_var.set(k); break
+                        solvent_var.set(k)
+                        break
             result_text.configure(state='normal')
             result_text.delete('1.0', tk.END)
             result_text.insert(tk.END, f"✅ 已加载模板：反应物={'+'.join(r_names)} → 产物={'+'.join(p_names)}\n")
@@ -2580,18 +2707,20 @@ class Dialogs:
             ("🌱 光合作用 (演示 CO2+H2O→有机物+O2)", ["co2", "h2o"], ["c2h6", "o2"], "water"),
             ("🔬 合成氨 N2+3H2→2NH3",            ["n2", "h2", "h2", "h2"], ["nh3", "nh3"], None),
         ]
-        rows: list[ttk.Frame] = [tpl_btn_row]
+        rows: list[ttk.Frame] = []
         for i, (label, rs, ps, sol) in enumerate(tpl_btns):
             row_idx, _col = divmod(i, 3)
             while len(rows) <= row_idx:
-                nr = ttk.Frame(tpl_frame); nr.pack(fill='x', pady=(4, 0)); rows.append(nr)
+                nr = ttk.Frame(tpl_frame)
+                nr.pack(fill='x', pady=(4, 0))
+                rows.append(nr)
             b = ttk.Button(rows[row_idx], text=label,
                            command=lambda _rs=rs, _ps=ps, _s=sol: _apply_template(_rs, _ps, _s))
             b.pack(side='left', padx=4, pady=2, fill='x', expand=True)
             from ui_builder import add_tooltip as _tt
             _tt(b, f"示例反应：\n反应物: {' + '.join(rs)}\n产物:   {' + '.join(ps)}")
-        # ============ 模板结束 ============
 
+        # ---------- 主界面内容（反应物/产物列表，溶剂，QM参数等）----------
         mol_filters = [("分子文件", "*.xyz *.mol *.sdf *.mol2"), ("所有文件", "*.*")]
         r_frame = ttk.LabelFrame(dialog, text="反应物列表（可多选，按先后顺序沿 +X 拼接）")
         r_frame.pack(fill='x', padx=12, pady=4)
@@ -2600,9 +2729,10 @@ class Dialogs:
         r_list.configure(yscrollcommand=r_sb.set)
         r_list.pack(side='left', fill='both', expand=True, padx=(8, 2), pady=6)
         r_sb.pack(side='left', fill='y', pady=6)
-        r_btns = ttk.Frame(r_frame); r_btns.pack(side='left', fill='y', padx=6, pady=6)
+        r_btns = ttk.Frame(r_frame)
+        r_btns.pack(side='left', fill='y', padx=6, pady=6)
         ttk.Button(r_btns, text="➕ 添加", width=10,
-                   command=lambda: _browse_open_multi(r_list)).pack(pady=2)
+                   command=lambda: self._browse_open_multi(r_list)).pack(pady=2)
         ttk.Button(r_btns, text="➖ 删除选中", width=10,
                    command=lambda: self._ra_delete_selected(r_list)).pack(pady=2)
 
@@ -2613,15 +2743,18 @@ class Dialogs:
         p_list.configure(yscrollcommand=p_sb.set)
         p_list.pack(side='left', fill='both', expand=True, padx=(8, 2), pady=6)
         p_sb.pack(side='left', fill='y', pady=6)
-        p_btns = ttk.Frame(p_frame); p_btns.pack(side='left', fill='y', padx=6, pady=6)
+        p_btns = ttk.Frame(p_frame)
+        p_btns.pack(side='left', fill='y', padx=6, pady=6)
         ttk.Button(p_btns, text="➕ 添加", width=10,
-                   command=lambda: _browse_open_multi(p_list)).pack(pady=2)
+                   command=lambda: self._browse_open_multi(p_list)).pack(pady=2)
         ttk.Button(p_btns, text="➖ 删除选中", width=10,
                    command=lambda: self._ra_delete_selected(p_list)).pack(pady=2)
 
+        # 溶剂和 QM 参数（简单模式可见）
         qm = ttk.LabelFrame(dialog, text="🧪 溶剂 & 能量（可选：一键跑 PSI4 线性扫描，自动写入每帧 E= 注释）")
         qm.pack(fill='x', padx=12, pady=(6, 4))
-        rq1 = ttk.Frame(qm); rq1.pack(fill='x', **pad)
+        rq1 = ttk.Frame(qm)
+        rq1.pack(fill='x', **pad)
         SOLVENT_CHOICES = [
             "（不使用溶剂，气相）",
             "water (水)",
@@ -2646,7 +2779,7 @@ class Dialogs:
         solvent_cb = ttk.Combobox(rq1, textvariable=solvent_var, state="readonly",
                                   width=42, values=SOLVENT_CHOICES)
         solvent_cb.pack(side='left', padx=(0, 8))
-        solvent_cb_var_to_key_map: dict[str, str | None] = {}
+        solvent_cb_var_to_key_map = {}
         for _it in SOLVENT_CHOICES:
             if _it.startswith("（不"):
                 solvent_cb_var_to_key_map[_it] = None
@@ -2665,7 +2798,8 @@ class Dialogs:
         qm_d3_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(rq1, text="D3 色散校正", variable=qm_d3_var).pack(side='left', padx=4)
 
-        rq2 = ttk.Frame(qm); rq2.pack(fill='x', **pad)
+        rq2 = ttk.Frame(qm)
+        rq2.pack(fill='x', **pad)
         ttk.Label(rq2, text="扫描帧数 (每帧单点能):", width=22, anchor='w').pack(side='left')
         scan_steps_var = tk.IntVar(value=10)
         ttk.Spinbox(rq2, from_=3, to=100, width=7, textvariable=scan_steps_var).pack(side='left')
@@ -2679,15 +2813,16 @@ class Dialogs:
         qm_mem_var = tk.StringVar(value="4 GB")
         ttk.Entry(rq2, textvariable=qm_mem_var, width=8).pack(side='left')
 
-        rq3 = ttk.Frame(qm); rq3.pack(fill='x', **pad)
-        preset_var = tk.StringVar(value="（无预设）")
-        ttk.Label(rq3, text="预设:", width=6, anchor='w').pack(side='left')
+        rq3 = ttk.Frame(qm)
+        rq3.pack(fill='x', **pad)
+        preset_psi4_var = tk.StringVar(value="（无预设）")
+        ttk.Label(rq3, text="PSI4 预设:", width=10, anchor='w').pack(side='left')
         try:
             from constants import PSI4_PRESETS as _PP
             _presets_list = ["（无预设）"] + sorted(list(_PP.keys()))
         except Exception:
             _presets_list = ["（无预设）"]
-        ttk.Combobox(rq3, textvariable=preset_var, width=28, state="readonly",
+        ttk.Combobox(rq3, textvariable=preset_psi4_var, width=28, state="readonly",
                      values=_presets_list).pack(side='left')
         scan_output_var = tk.StringVar(value=str(self.controller.model.work_dir / "scan_output"))
         ttk.Label(rq3, text="  扫描输出目录:", width=14, anchor='w').pack(side='left')
@@ -2700,159 +2835,13 @@ class Dialogs:
         run_scan_btn = ttk.Button(rq3, text="⚡ 运行 PSI4 线性扫描并自动填 CSV", width=40)
         run_scan_btn.pack(side='right', padx=4)
 
-        def _run_scan_and_fill():
-            reactants = [r_list.get(i) for i in range(r_list.size())]
-            products = [p_list.get(i) for i in range(p_list.size())]
-            if len(reactants) == 0 or len(products) == 0:
-                messagebox.showwarning("提示", "请先添加反应物和产物文件（至少各 1 个）", parent=dialog)
-                return
-            try:
-                spacing_val = float(spacing_var.get())
-                scan_steps_val = max(2, int(scan_steps_var.get()))
-                qm_method_val = str(qm_method_var.get()).strip() or "b3lyp"
-                qm_basis_val = str(qm_basis_var.get()).strip() or "6-31g*"
-                qm_output_dir_val = str(scan_output_var.get()).strip() or None
-                solvent_val = solvent_cb_var_to_key_map.get(solvent_var.get())
-                preset_val = None if preset_var.get().startswith("（无") else str(preset_var.get()).strip()
-                qm_d3_val = bool(qm_d3_var.get())
-                qm_charge_val = int(qm_charge_var.get())
-                qm_mult_val = int(qm_mult_var.get())
-                qm_mem_val = str(qm_mem_var.get()).strip() or "4 GB"
-                if qm_output_dir_val:
-                    try:
-                        _p_out = Path(qm_output_dir_val).resolve()
-                        import platform
-                        if platform.system() == "Windows":
-                            _root = _p_out.anchor
-                            _sens = [
-                                Path(_root) / "Windows",
-                                Path(_root) / "Program Files",
-                                Path(_root) / "Program Files (x86)",
-                                Path(_root) / "ProgramData",
-                                Path(_root) / "System Volume Information",
-                            ]
-                            for _s in _sens:
-                                try:
-                                    _p_out.relative_to(_s)
-                                    if not messagebox.askyesno(
-                                        "确认输出目录",
-                                        f"检测到输出目录位于系统敏感目录 {_s} 下，\n继续写入可能需要管理员权限或失败。\n\n是否仍继续？",
-                                        parent=dialog):
-                                        scan_btn.configure(state="normal")
-                                        return
-                                    break
-                                except ValueError:
-                                    continue
-                    except Exception:
-                        pass
-            except (ValueError, TypeError) as _e:
-                messagebox.showwarning("提示", f"扫描参数格式错误: {_e}", parent=dialog)
-                return
-            dlg = dialog
-            scan_btn = run_scan_btn
-            scan_btn.configure(state="disabled")
-            ui_updates_pending: dict[str, Any] = {}
-            def _scan_task(**kw):
-                cb = kw.get('_progress_callback')
-                import tempfile as _tf
-                from psi4_compute import _write_xyz, run_linear_scan
-                with _tf.TemporaryDirectory(prefix="qm_scan_setup_") as _td:
-                    _tdp = Path(_td)
-                    try:
-                        _nR, _aR, _cR = ra._concat_xyz_files(reactants, translate_spacing=spacing_val)
-                        _nP, _aP, _cP = ra._concat_xyz_files(products, translate_spacing=spacing_val)
-                        _aP2, _cP2 = ra._auto_reorder_atoms(_aR, _cR, _aP, _cP)
-                    except Exception as _e:
-                        return {"ok": False, "error": f"分子对齐失败: {_e}", "msgs": []}
-                    _rx = _tdp / "R.xyz"; _px = _tdp / "P.xyz"
-                    _rx.write_text(_write_xyz(_nR, _aR, _cR), encoding="utf-8")
-                    _px.write_text(_write_xyz(_nP, _aP2, _cP2), encoding="utf-8")
-                    try:
-                        if qm_output_dir_val:
-                            os.makedirs(qm_output_dir_val, exist_ok=True)
-                    except Exception:
-                        pass
-                    res = run_linear_scan(
-                        [str(_rx)], [str(_px)],
-                        steps=scan_steps_val,
-                        method=qm_method_val,
-                        basis=qm_basis_val,
-                        output_dir=qm_output_dir_val,
-                        preset_name=preset_val,
-                        solvent=solvent_val,
-                        d3=qm_d3_val,
-                        charge=qm_charge_val,
-                        multiplicity=qm_mult_val,
-                        memory=qm_mem_val,
-                        _progress_callback=cb,
-                    )
-                if res.get("scan_csv"):
-                    ui_updates_pending["csv"] = str(res["scan_csv"])
-                return {"ok": bool(res.get("success")),
-                        "error": res.get("error"),
-                        "csv": res.get("scan_csv"),
-                        "n_steps": len(res.get("energies") or [])}
-            def _after_dialog_safe(result):
-                if "csv" in ui_updates_pending:
-                    try:
-                        csv_var.set(ui_updates_pending["csv"])
-                    except Exception:
-                        pass
-                try:
-                    scan_btn.configure(state="normal")
-                except Exception:
-                    pass
-                if not isinstance(result, dict):
-                    try:
-                        messagebox.showerror("失败", "扫描任务未返回结果", parent=dlg)
-                    except Exception:
-                        pass
-                    return
-                if result.get("ok"):
-                    csv_path = result.get("csv")
-                    body = (f"✅ PSI4 线性扫描完成（共 {result.get('n_steps')} 帧）\n"
-                            f"   CSV: {csv_path}\n"
-                            f"   溶剂: {solvent_cb_var_to_key_map.get(solvent_var.get()) or '(气相)'}\n\n"
-                            f"现在生成动画/IQmol 轨迹时将自动读取每帧能量 E= 注释")
-                    try:
-                        messagebox.showinfo("扫描完成", body, parent=dlg)
-                    except Exception:
-                        pass
-                else:
-                    err = result.get("error") or "未知错误"
-                    try:
-                        messagebox.showerror("扫描失败", f"❌ {err}", parent=dlg)
-                    except Exception:
-                        pass
-            dlg_update_ref = [dialog]
-            def _submit():
-                def runner(**kw):
-                    res = _scan_task(**kw)
-                    def _after_run():
-                        try:
-                            if dlg_update_ref and dlg_update_ref[0] and dlg_update_ref[0].winfo_exists():
-                                _after_dialog_safe(res)
-                        except Exception:
-                            pass
-                    try:
-                        self.app.after(0, _after_run)
-                    except Exception:
-                        pass
-                    return res
-                self.app.helpers.run_task(runner)
-            _submit()
+        # ---------- 高级参数（放入 advanced_container）----------
+        advanced_container = ttk.LabelFrame(dialog, text="⚙️ 高级参数（步数/模式/FFmpeg/轨迹等）", padding="8")
+        # 暂不 pack，由 _toggle_mode 控制
 
-        run_scan_btn.configure(command=_run_scan_and_fill)
-
-        row_csv = ttk.Frame(dialog); row_csv.pack(fill='x', **pad)
-        ttk.Label(row_csv, text="势能面能量 CSV:", width=18, anchor='w').pack(side='left')
-        ttk.Entry(row_csv, textvariable=csv_var).pack(side='left', fill='x', expand=True, padx=(4, 4))
-        ttk.Button(row_csv, text="浏览...", width=8,
-                   command=lambda: _browse_open(csv_var, "选择线性扫描结果 CSV（可选）",
-                                                 [("CSV 文件", "*.csv"), ("所有文件", "*.*")])).pack(side='left')
-
-        opts = ttk.LabelFrame(dialog, text="插值 / 可视化参数"); opts.pack(fill='x', padx=12, pady=(6, 6))
-        r1 = ttk.Frame(opts); r1.pack(fill='x', **pad)
+        opts = advanced_container
+        r1 = ttk.Frame(opts)
+        r1.pack(fill='x', **pad)
         ttk.Label(r1, text="插值步数 (单程):", width=18, anchor='w').pack(side='left')
         steps_var = tk.IntVar(value=30)
         ttk.Spinbox(r1, from_=5, to=500, width=7, textvariable=steps_var).pack(side='left')
@@ -2870,7 +2859,8 @@ class Dialogs:
         spacing_var = tk.DoubleVar(value=5.0)
         ttk.Spinbox(r1, from_=2.0, to=30.0, increment=0.5, width=6, textvariable=spacing_var).pack(side='left')
 
-        r2 = ttk.Frame(opts); r2.pack(fill='x', **pad)
+        r2 = ttk.Frame(opts)
+        r2.pack(fill='x', **pad)
         smooth_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(r2, text="cosine 缓动（首尾更平滑）", variable=smooth_var).pack(side='left')
 
@@ -2885,39 +2875,51 @@ class Dialogs:
                      values=["gif (GIF 动图，Pillow)", "mp4 (MP4 视频，ffmpeg)",
                              "png_dir (仅输出 PNG 帧目录)", "none (不生成可视化，只做 IQmol 轨迹)"]).pack(side='left')
 
-        r3 = ttk.Frame(opts); r3.pack(fill='x', **pad)
+        r3 = ttk.Frame(opts)
+        r3.pack(fill='x', **pad)
         ttk.Label(r3, text="ffmpeg 路径:", width=18, anchor='w').pack(side='left')
+        ffmpeg_var = tk.StringVar(value="ffmpeg")
         ttk.Entry(r3, textvariable=ffmpeg_var, width=32).pack(side='left')
         cap = "（仅 MP4 格式需要；默认 PATH 的 ffmpeg）"
         ttk.Label(r3, text=cap, foreground='#6a737d').pack(side='left', padx=(8, 0))
 
-        if not ra.PIL_AVAILABLE:
-            ttk.Label(dialog,
-                text="⚠️  未检测到 Pillow，无法添加字幕条、无法合成 GIF（已自动回退为仅 PNG 目录）；建议 pip install pillow",
-                foreground='#d73a49', wraplength=860, justify='left').pack(padx=12, pady=(4, 4), anchor='w')
-
-        iq = ttk.LabelFrame(dialog, text="🧪 IQmol 可播放轨迹输出（推荐！支持多反应物/多产物）")
+        # IQmol 轨迹输出
+        iq = ttk.LabelFrame(advanced_container, text="🧪 IQmol 可播放轨迹输出（推荐！支持多反应物/多产物）")
         iq.pack(fill='x', padx=12, pady=(4, 4))
+        gen_traj_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(iq, text="同时生成 IQmol 多帧轨迹文件（推荐 always on）",
                         variable=gen_traj_var).pack(padx=10, pady=(6, 2), anchor='w')
-        row_t = ttk.Frame(iq); row_t.pack(fill='x', **pad)
+        row_t = ttk.Frame(iq)
+        row_t.pack(fill='x', **pad)
         ttk.Label(row_t, text="IQmol 轨迹输出:", width=18, anchor='w').pack(side='left')
+        traj_var = tk.StringVar(value=str(self.controller.model.work_dir / "reaction_trajectory.xyz"))
         ttk.Entry(row_t, textvariable=traj_var).pack(side='left', fill='x', expand=True, padx=(4, 4))
         ttk.Button(row_t, text="浏览...", width=8,
-                   command=lambda: _browse_save(traj_var, "保存 IQmol 轨迹文件", ".xyz",
+                   command=lambda: self._browse_save(traj_var, "保存 IQmol 轨迹文件", ".xyz",
                                                 [("IQmol 多帧 XYZ", "*.xyz"),
                                                  ("SDF 轨迹", "*.sdf"),
                                                  ("所有文件", "*.*")])).pack(side='left')
 
-        rq = ttk.Frame(iq); rq.pack(fill='x', **pad)
+        rq = ttk.Frame(iq)
+        rq.pack(fill='x', **pad)
         ttk.Label(rq, text="轨迹格式:", width=18, anchor='w').pack(side='left')
+        traj_fmt_var = tk.StringVar(value="xyz (Concatenated 多帧 XYZ，IQmol 直接播放)")
         ttk.Combobox(rq, textvariable=traj_fmt_var, state="readonly", width=26,
                      values=["xyz (Concatenated 多帧 XYZ，IQmol 直接播放)",
                              "sdf (SDF 多构象，带 >  <Energy> 字段)"]).pack(side='left')
 
         ttk.Label(rq, text="   IQmol 程序路径:", width=16, anchor='w').pack(side='left')
+        iqmol_path_var = tk.StringVar(value="IQmol")
         ttk.Entry(rq, textvariable=iqmol_path_var, width=22).pack(side='left')
+        auto_open_iqmol_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(rq, text="生成后立即打开", variable=auto_open_iqmol_var).pack(side='left', padx=(10, 0))
+
+        # 可视化输出路径（高级）
+        row_out = ttk.Frame(advanced_container)
+        row_out.pack(fill='x', **pad)
+        ttk.Label(row_out, text="可视化输出:", width=18, anchor='w').pack(side='left')
+        out_var = tk.StringVar(value=str(self.controller.model.work_dir / "reaction_animation.gif"))
+        ttk.Entry(row_out, textvariable=out_var).pack(side='left', fill='x', expand=True, padx=(4, 4))
 
         def _def_ext_for_format(fmt_tok: str, traj: bool) -> tuple[str, list[tuple[str, str]]]:
             if traj:
@@ -2950,172 +2952,318 @@ class Dialogs:
         fmt_var.trace_add("write", lambda *_: _on_change_fmt())
         traj_fmt_var.trace_add("write", lambda *_: _on_change_fmt())
 
-        row_out = ttk.Frame(dialog); row_out.pack(fill='x', **pad)
-        ttk.Label(row_out, text="可视化输出:", width=18, anchor='w').pack(side='left')
-        ttk.Entry(row_out, textvariable=out_var).pack(side='left', fill='x', expand=True, padx=(4, 4))
         ttk.Button(row_out, text="浏览...", width=8,
-                   command=lambda: _browse_save(out_var, "选择可视化输出",
-                                                *_def_ext_for_format(fmt_var.get().strip().lower(), False))).pack(side='left')
+                   command=lambda: self._browse_save(out_var, "选择可视化输出",
+                                                _def_ext_for_format(fmt_var.get().strip().lower(), False)[0],
+                                                _def_ext_for_format(fmt_var.get().strip().lower(), False)[1])).pack(side='left')
 
-        selected_files = (self.app.helpers.get_selected_file_info()
-                          if hasattr(self.app.helpers, 'get_selected_file_info') else [])
-        if selected_files:
-            work = self.controller.model.work_dir
-            cands = [s for s in selected_files if Path(s['name']).suffix.lower() in ('.xyz', '.mol', '.sdf', '.mol2')]
-            mid = len(cands) // 2
-            for s in cands[:max(1, mid)]:
-                try:
-                    self._ra_add_unique_path(r_list, str(work / s['name']))
-                except Exception:
-                    pass
-            for s in cands[max(1, mid):]:
-                try:
-                    self._ra_add_unique_path(p_list, str(work / s['name']))
-                except Exception:
-                    pass
+        # ---------- 预览按钮和生成按钮 ----------
+        preview_btn = ttk.Button(dialog, text="👁️ 预览第一帧（快速查看效果）",
+                                 command=lambda: self._preview_frame(dialog, r_list, p_list, spacing_var))
+        preview_btn.pack(pady=4)
+
+        # 结果显示区
+        result_text = scrolledtext.ScrolledText(dialog, height=4, wrap=tk.WORD, font=('Consolas', 9))
+        result_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+        result_text.configure(state='disabled')
+
+        # 底部按钮
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(fill=tk.X, padx=12, pady=(8, 12))
 
         def _start():
-            reactants = [r_list.get(i) for i in range(r_list.size())]
-            products = [p_list.get(i) for i in range(p_list.size())]
-            out = out_var.get().strip()
-            traj = traj_var.get().strip() if gen_traj_var.get() else ""
-            if len(reactants) == 0:
-                messagebox.showwarning("提示", "请至少添加 1 个反应物文件", parent=dialog); return
-            if len(products) == 0:
-                messagebox.showwarning("提示", "请至少添加 1 个产物文件", parent=dialog); return
-            for f in reactants + products:
-                if not Path(f).exists():
-                    messagebox.showwarning("提示", f"文件不存在: {f}", parent=dialog); return
-            if not out and not traj:
-                messagebox.showwarning("提示", "请至少选择：可视化输出 或 IQmol 轨迹输出", parent=dialog); return
-            mode_s = mode_var.get().strip().lower()
-            mode = "forward" if mode_s.startswith("forward") else "bounce"
-            fmt_s = fmt_var.get().strip().lower()
-            fmt = "mp4" if fmt_s.startswith("mp4") else (
-                "png_dir" if fmt_s.startswith("png_dir") else (
-                    "none" if fmt_s.startswith("none") else "gif"))
-            res_s = res_var.get().strip().lower()
-            resolution = "sd" if res_s.startswith("sd") else ("fullhd" if res_s.startswith("fullhd") else "hd")
-            csv_path = csv_var.get().strip() or None
-            traj_fmt = "sdf" if traj_fmt_var.get().strip().lower().startswith("sdf") else "xyz"
-            spacing = float(spacing_var.get())
+            self._start_animation(
+                dialog, r_list, p_list, steps_var, mode_var, fps_var, spacing_var,
+                smooth_var, res_var, fmt_var, ffmpeg_var, gen_traj_var, traj_var,
+                traj_fmt_var, iqmol_path_var, auto_open_iqmol_var, out_var,
+                solvent_var, qm_method_var, qm_basis_var, qm_d3_var, qm_charge_var,
+                qm_mult_var, qm_mem_var, scan_steps_var, scan_output_var,
+                preset_psi4_var, solvent_cb_var_to_key_map, result_text
+            )
 
-            def _task(**kwargs):
-                progress_cb = kwargs.get('_progress_callback')
-                msgs: list[str] = []
-                viz_ok = traj_ok = False
-                viz_out = traj_out = None
-
-                if fmt != "none" and out:
-                    if progress_cb:
-                        progress_cb(0, "开始生成可视化动画")
-                    if len(reactants) == 1 and len(products) == 1:
-                        r = ra.generate_reaction_animation(
-                            reactants[0], products[0], out,
-                            steps=max(2, int(steps_var.get())),
-                            mode=mode, smooth=bool(smooth_var.get()),
-                            fmt=fmt, resolution=resolution,
-                            energy_csv=csv_path,
-                            ffmpeg_path=ffmpeg_var.get().strip() or "ffmpeg",
-                            fps=max(1, int(fps_var.get())),
-                            progress_callback=progress_cb,
-                        )
-                    else:
-                        import tempfile as _tf
-                        from psi4_compute import _write_xyz
-                        with _tf.TemporaryDirectory(prefix="ms_viz_") as _td:
-                            _tdp = Path(_td)
-                            _nR, _aR, _cR = ra._concat_xyz_files(reactants, translate_spacing=spacing)
-                            _nP, _aP, _cP = ra._concat_xyz_files(products, translate_spacing=spacing)
-                            try:
-                                _aP2, _cP2 = ra._auto_reorder_atoms(_aR, _cR, _aP, _cP)
-                            except Exception as _e:
-                                msgs.append("❌ 可视化（反应物/产物）原子对齐失败: " + str(_e))
-                                r = {"success": False, "error": "原子对齐失败"}
-                                _aP2, _cP2 = _aP, _cP
-                            else:
-                                _rx = _tdp / "R.xyz"; _px = _tdp / "P.xyz"
-                                _rx.write_text(_write_xyz(_nR, _aR, _cR), encoding="utf-8")
-                                _px.write_text(_write_xyz(_nP, _aP2, _cP2), encoding="utf-8")
-                                r = ra.generate_reaction_animation(
-                                    str(_rx), str(_px), out,
-                                    steps=max(2, int(steps_var.get())),
-                                    mode=mode, smooth=bool(smooth_var.get()),
-                                    fmt=fmt, resolution=resolution,
-                                    energy_csv=csv_path,
-                                    ffmpeg_path=ffmpeg_var.get().strip() or "ffmpeg",
-                                    fps=max(1, int(fps_var.get())),
-                                    progress_callback=progress_cb,
-                                )
-                    viz_ok = bool(r.get("success"))
-                    viz_out = r.get("output")
-                    if viz_ok:
-                        msgs.append(f"✅ 可视化: {viz_out} （{r.get('n_frames')} 帧）")
-                    else:
-                        msgs.append("❌ 可视化: " + (r.get("error") or "未知错误"))
-                        if r.get("frames_dir"):
-                            msgs.append("   帧目录已保留: " + r["frames_dir"])
-
-                if traj:
-                    if progress_cb:
-                        progress_cb(0, "开始生成 IQmol 轨迹")
-                    if len(reactants) == 1 and len(products) == 1:
-                        rr = ra.generate_xyz_trajectory(
-                            reactants[0], products[0], traj,
-                            steps=max(2, int(steps_var.get())),
-                            mode=mode, smooth=bool(smooth_var.get()),
-                            trajectory_format=traj_fmt,
-                            energy_csv=csv_path,
-                            progress_callback=progress_cb,
-                        )
-                    else:
-                        rr = ra.generate_reaction_multispecies(
-                            reactants, products, traj,
-                            steps=max(2, int(steps_var.get())),
-                            mode=mode, smooth=bool(smooth_var.get()),
-                            trajectory_format=traj_fmt,
-                            energy_csv=csv_path,
-                            translate_spacing=spacing,
-                            progress_callback=progress_cb,
-                        )
-                    traj_ok = bool(rr.get("success"))
-                    traj_out = rr.get("output")
-                    if traj_ok:
-                        tag = "（含每帧能量 E）" if rr.get("energies_written") else ""
-                        msgs.append(f"✅ IQmol 轨迹: {traj_out} （{rr.get('n_frames')} 帧） {tag}")
-                    else:
-                        msgs.append("❌ IQmol 轨迹: " + (rr.get("error") or "未知错误"))
-
-                def _after():
-                    any_ok = viz_ok or traj_ok
-                    body = "\n".join(msgs)
-                    if auto_open_iqmol_var.get() and traj_ok and traj_out:
-                        try:
-                            exe = iqmol_path_var.get().strip() or "IQmol"
-                            resolved = Dialogs._resolve_iqmol_exe(exe)
-                            _sp.Popen([resolved, str(traj_out)])
-                            body += "\n\n🚀 已用 IQmol 打开轨迹"
-                        except Exception as e:
-                            body += f"\n\n⚠️  未能打开 IQmol: {e}"
-                    if any_ok:
-                        messagebox.showinfo("完成", body, parent=dialog)
-                        self.controller.scan_files()
-                    else:
-                        messagebox.showerror("失败", body or "未产生任何产出", parent=dialog)
-                self.app.after(0, _after)
-
-            dialog.withdraw()
-            self.app.helpers.run_task(_task)
-
-        btn_row = ttk.Frame(dialog); btn_row.pack(fill='x', padx=12, pady=(12, 12))
         ttk.Button(btn_row, text="🎬 开始生成动画 / 轨迹", command=_start).pack(side='right', padx=4)
-        def _safe_close():
-            _cb = getattr(dialog, "_orig_close_ra_tpl_", None)
-            if callable(_cb):
-                _cb()
+        ttk.Button(btn_row, text="关闭", command=dialog.destroy).pack(side='right', padx=4)
+
+        # 辅助函数：切换模式
+        def _toggle_mode(mode):
+            if mode == "simple":
+                advanced_container.pack_forget()
+                mode_tip.config(text="💡 简单模式：只显示核心参数，高级选项已隐藏")
+                try:
+                    self.app.config_data["ui_mode"] = "simple"
+                    from config import save_config
+                    save_config(self.app.config_data)
+                except Exception:
+                    pass
             else:
-                dialog.destroy()
-        ttk.Button(btn_row, text="关闭", command=_safe_close).pack(side='right', padx=4)
+                advanced_container.pack(fill=tk.X, padx=12, pady=4, before=preview_btn)
+                mode_tip.config(text="🔧 高级模式：全部参数可调")
+                try:
+                    self.app.config_data["ui_mode"] = "advanced"
+                    from config import save_config
+                    save_config(self.app.config_data)
+                except Exception:
+                    pass
+
+        # 初始显示
+        _toggle_mode(mode_var.get())
+        mode_var.trace_add("write", lambda *_: _toggle_mode(mode_var.get()))
+
+        # 保存对话框引用供预览使用
+        self._anim_dialog = dialog
+        self._anim_r_list = r_list
+        self._anim_p_list = p_list
+        self._anim_spacing_var = spacing_var
+
+        # 初始化时加载默认预设
+        auto_load = self.app.config_data.get("preset_auto_load", "")
+        if auto_load and auto_load in pm.list_presets():
+            preset_var.set(auto_load)
+            _load_preset()
+
+    # ---------- 预览第一帧 ----------
+    def _preview_frame(self, dialog, r_list, p_list, spacing_var):
+        if not dialog or not dialog.winfo_exists():
+            return
+        reactants = [r_list.get(i) for i in range(r_list.size())]
+        products = [p_list.get(i) for i in range(p_list.size())]
+        if not reactants or not products:
+            messagebox.showwarning("提示", "请先添加反应物和产物", parent=dialog)
+            return
+
+        spacing = float(spacing_var.get()) if spacing_var else 5.0
+        preview_path = Path(tempfile.gettempdir()) / "preview_frame.png"
+
+        def _task(**kwargs):
+            import reaction_animation as ra
+            import tempfile
+            if len(reactants) == 1 and len(products) == 1:
+                r = ra.preview_first_frame(reactants[0], products[0], preview_path,
+                                           width=800, height=600)
+            else:
+                with tempfile.TemporaryDirectory(prefix="ms_preview_") as td:
+                    tdp = Path(td)
+                    nR, aR, cR = ra._concat_xyz_files(reactants, translate_spacing=spacing)
+                    nP, aP, cP = ra._concat_xyz_files(products, translate_spacing=spacing)
+                    aP2, cP2 = ra._auto_reorder_atoms(aR, cR, aP, cP)
+                    rx = tdp / "R.xyz"
+                    px = tdp / "P.xyz"
+                    rx.write_text(ra._write_xyz(nR, aR, cR), encoding="utf-8")
+                    px.write_text(ra._write_xyz(nP, aP2, cP2), encoding="utf-8")
+                    r = ra.preview_first_frame(str(rx), str(px), preview_path,
+                                               width=800, height=600)
+            def _show():
+                if r.get("success"):
+                    try:
+                        if sys.platform == "win32":
+                            os.startfile(preview_path)
+                        elif sys.platform == "darwin":
+                            subprocess.Popen(["open", preview_path])
+                        else:
+                            subprocess.Popen(["xdg-open", preview_path])
+                    except Exception:
+                        messagebox.showinfo("预览已生成", f"预览图片保存在:\n{preview_path}", parent=dialog)
+                else:
+                    messagebox.showerror("预览失败", r.get("error", "未知错误"), parent=dialog)
+            self.app.after(0, _show)
+        self.app.helpers.run_task(_task)
+
+    # ---------- 启动生成动画 ----------
+    def _start_animation(self, dialog, r_list, p_list, steps_var, mode_var, fps_var,
+                         spacing_var, smooth_var, res_var, fmt_var, ffmpeg_var,
+                         gen_traj_var, traj_var, traj_fmt_var, iqmol_path_var,
+                         auto_open_iqmol_var, out_var, solvent_var, qm_method_var,
+                         qm_basis_var, qm_d3_var, qm_charge_var, qm_mult_var,
+                         qm_mem_var, scan_steps_var, scan_output_var,
+                         preset_psi4_var, solvent_cb_var_to_key_map, result_text):
+        import reaction_animation as ra
+        import subprocess as _sp
+        import shutil as _shu
+
+        reactants = [r_list.get(i) for i in range(r_list.size())]
+        products = [p_list.get(i) for i in range(p_list.size())]
+        out = out_var.get().strip()
+        traj = traj_var.get().strip() if gen_traj_var.get() else ""
+        if len(reactants) == 0:
+            messagebox.showwarning("提示", "请至少添加 1 个反应物文件", parent=dialog); return
+        if len(products) == 0:
+            messagebox.showwarning("提示", "请至少添加 1 个产物文件", parent=dialog); return
+        for f in reactants + products:
+            if not Path(f).exists():
+                messagebox.showwarning("提示", f"文件不存在: {f}", parent=dialog); return
+        if not out and not traj:
+            messagebox.showwarning("提示", "请至少选择：可视化输出 或 IQmol 轨迹输出", parent=dialog); return
+
+        mode_s = mode_var.get().strip().lower()
+        mode = "forward" if mode_s.startswith("forward") else "bounce"
+        fmt_s = fmt_var.get().strip().lower()
+        fmt = "mp4" if fmt_s.startswith("mp4") else ("png_dir" if fmt_s.startswith("png_dir") else ("none" if fmt_s.startswith("none") else "gif"))
+        res_s = res_var.get().strip().lower()
+        resolution = "sd" if res_s.startswith("sd") else ("fullhd" if res_s.startswith("fullhd") else "hd")
+        csv_path = None  # 由用户后续提供
+        traj_fmt = "sdf" if traj_fmt_var.get().strip().lower().startswith("sdf") else "xyz"
+        spacing = float(spacing_var.get())
+
+        def _task(**kwargs):
+            progress_cb = kwargs.get('_progress_callback')
+            msgs: list[str] = []
+            viz_ok = traj_ok = False
+            viz_out = traj_out = None
+
+            if fmt != "none" and out:
+                if progress_cb: progress_cb(0, "开始生成可视化动画")
+                if len(reactants) == 1 and len(products) == 1:
+                    r = ra.generate_reaction_animation(
+                        reactants[0], products[0], out,
+                        steps=max(2, int(steps_var.get())),
+                        mode=mode, smooth=bool(smooth_var.get()),
+                        fmt=fmt, resolution=resolution,
+                        energy_csv=csv_path,
+                        ffmpeg_path=ffmpeg_var.get().strip() or "ffmpeg",
+                        fps=max(1, int(fps_var.get())),
+                        progress_callback=progress_cb,
+                    )
+                else:
+                    import tempfile as _tf
+                    from psi4_compute import _write_xyz
+                    with _tf.TemporaryDirectory(prefix="ms_viz_") as _td:
+                        _tdp = Path(_td)
+                        _nR, _aR, _cR = ra._concat_xyz_files(reactants, translate_spacing=spacing)
+                        _nP, _aP, _cP = ra._concat_xyz_files(products, translate_spacing=spacing)
+                        try:
+                            _aP2, _cP2 = ra._auto_reorder_atoms(_aR, _cR, _aP, _cP)
+                        except Exception as _e:
+                            msgs.append("❌ 可视化（反应物/产物）原子对齐失败: " + str(_e))
+                            r = {"success": False, "error": "原子对齐失败"}
+                            _aP2, _cP2 = _aP, _cP
+                        else:
+                            _rx = _tdp / "R.xyz"; _px = _tdp / "P.xyz"
+                            _rx.write_text(_write_xyz(_nR, _aR, _cR), encoding="utf-8")
+                            _px.write_text(_write_xyz(_nP, _aP2, _cP2), encoding="utf-8")
+                            r = ra.generate_reaction_animation(
+                                str(_rx), str(_px), out,
+                                steps=max(2, int(steps_var.get())),
+                                mode=mode, smooth=bool(smooth_var.get()),
+                                fmt=fmt, resolution=resolution,
+                                energy_csv=csv_path,
+                                ffmpeg_path=ffmpeg_var.get().strip() or "ffmpeg",
+                                fps=max(1, int(fps_var.get())),
+                                progress_callback=progress_cb,
+                            )
+                viz_ok = bool(r.get("success"))
+                viz_out = r.get("output")
+                if viz_ok:
+                    msgs.append(f"✅ 可视化: {viz_out} （{r.get('n_frames')} 帧）")
+                else:
+                    msgs.append("❌ 可视化: " + (r.get("error") or "未知错误"))
+                    if r.get("frames_dir"):
+                        msgs.append("   帧目录已保留: " + r["frames_dir"])
+
+            if traj:
+                if progress_cb: progress_cb(0, "开始生成 IQmol 轨迹")
+                if len(reactants) == 1 and len(products) == 1:
+                    rr = ra.generate_xyz_trajectory(
+                        reactants[0], products[0], traj,
+                        steps=max(2, int(steps_var.get())),
+                        mode=mode, smooth=bool(smooth_var.get()),
+                        trajectory_format=traj_fmt,
+                        energy_csv=csv_path,
+                        progress_callback=progress_cb,
+                    )
+                else:
+                    rr = ra.generate_reaction_multispecies(
+                        reactants, products, traj,
+                        steps=max(2, int(steps_var.get())),
+                        mode=mode, smooth=bool(smooth_var.get()),
+                        trajectory_format=traj_fmt,
+                        energy_csv=csv_path,
+                        translate_spacing=spacing,
+                        progress_callback=progress_cb,
+                    )
+                traj_ok = bool(rr.get("success"))
+                traj_out = rr.get("output")
+                if traj_ok:
+                    tag = "（含每帧能量 E）" if rr.get("energies_written") else ""
+                    msgs.append(f"✅ IQmol 轨迹: {traj_out} （{rr.get('n_frames')} 帧） {tag}")
+                else:
+                    msgs.append("❌ IQmol 轨迹: " + (rr.get("error") or "未知错误"))
+
+            def _after():
+                any_ok = viz_ok or traj_ok
+                body = "\n".join(msgs)
+                if auto_open_iqmol_var.get() and traj_ok and traj_out:
+                    try:
+                        exe = iqmol_path_var.get().strip() or "IQmol"
+                        resolved = Dialogs._resolve_iqmol_exe(exe)
+                        _sp.Popen([resolved, str(traj_out)])
+                        body += "\n\n🚀 已用 IQmol 打开轨迹"
+                    except Exception as e:
+                        body += f"\n\n⚠️  未能打开 IQmol: {e}"
+                # 更新结果文本框
+                try:
+                    result_text.configure(state='normal')
+                    result_text.delete('1.0', tk.END)
+                    result_text.insert(tk.END, body)
+                    result_text.configure(state='disabled')
+                except Exception:
+                    pass
+                if any_ok:
+                    # 显示完成对话框，并添加「打开文件」按钮
+                    result_dialog = tk.Toplevel(dialog)
+                    result_dialog.title("✅ 生成完成")
+                    result_dialog.geometry("480x350")
+                    result_dialog.transient(dialog)
+                    result_dialog.grab_set()
+                    tk.Label(result_dialog, text="🎉 反应动画生成完成！",
+                             font=('Microsoft YaHei', 14, 'bold'), fg="#0EA288").pack(pady=(20, 10))
+                    tk.Label(result_dialog, text=body[:200] + ("..." if len(body)>200 else ""),
+                             wraplength=440, justify="left").pack(padx=20, pady=5)
+                    btn_frame = ttk.Frame(result_dialog)
+                    btn_frame.pack(pady=15)
+                    def _open_file():
+                        if traj_out and Path(traj_out).exists():
+                            self._safe_open_file(traj_out)
+                        elif viz_out and Path(viz_out).exists():
+                            self._safe_open_file(viz_out)
+                    def _open_folder():
+                        path = traj_out or viz_out
+                        if path:
+                            self._safe_open_file(str(Path(path).parent))
+                    ttk.Button(btn_frame, text="📂 打开文件", command=_open_file).pack(side=tk.LEFT, padx=5)
+                    ttk.Button(btn_frame, text="📁 打开所在文件夹", command=_open_folder).pack(side=tk.LEFT, padx=5)
+                    ttk.Button(btn_frame, text="关闭", command=result_dialog.destroy).pack(side=tk.LEFT, padx=5)
+                    # 记录最近文件
+                    try:
+                        recent = self.app.config_data.get("recent_files", [])
+                        for p in (traj_out, viz_out):
+                            if p and Path(p).exists():
+                                if p in recent: recent.remove(p)
+                                recent.insert(0, p)
+                        self.app.config_data["recent_files"] = recent[:10]
+                        from config import save_config
+                        save_config(self.app.config_data)
+                    except Exception:
+                        pass
+                    self.controller.scan_files()
+                else:
+                    messagebox.showerror("失败", body or "未产生任何产出", parent=dialog)
+            self.app.after(0, _after)
+
+        dialog.withdraw()
+        self.app.helpers.run_task(_task)
+
+    def _browse_open_multi(self, listbox):
+        init = str(self.controller.model.work_dir)
+        fs = filedialog.askopenfilenames(parent=self.app, initialdir=init,
+            title="选择分子文件（可多选）",
+            filetypes=[("分子文件", "*.xyz *.mol *.sdf *.mol2"), ("所有文件", "*.*")])
+        if fs:
+            for f in fs:
+                self._ra_add_unique_path(listbox, f)
+
+    def _ra_delete_selected(self, listbox):
+        for i in reversed(list(listbox.curselection())):
+            listbox.delete(i)
 
     def _ra_add_unique_path(self, listbox, path):
         path = str(path)
@@ -3124,10 +3272,14 @@ class Dialogs:
                 return
         listbox.insert(tk.END, path)
 
-    def _ra_delete_selected(self, listbox):
-        for i in reversed(list(listbox.curselection())):
-            listbox.delete(i)
+    def _browse_save(self, store_var, title, ext, filters):
+        init = str(self.controller.model.work_dir)
+        f = filedialog.asksaveasfilename(parent=self.app, initialdir=init, title=title,
+            defaultextension=ext, filetypes=filters)
+        if f:
+            store_var.set(f)
 
+    # ============ 历史记录对话框 ============
     def show_history_dialog(self):
         dialog = tk.Toplevel(self.app)
         dialog.title("📜 历史记录可视化面板")
@@ -3199,6 +3351,7 @@ class Dialogs:
         for item in redo_snap:
             redo_listbox.insert(tk.END, f"[{item['idx']}] {item['description']} ({item['file_count']} 文件)")
 
+    # ============ 结果浏览器对话框 ============
     def show_results_browser_dialog(self):
         dialog = tk.Toplevel(self.app)
         dialog.title("📊 计算结果浏览")
@@ -3495,6 +3648,7 @@ class Dialogs:
 
         refresh_tree()
 
+    # ============ 目录同步对话框 ============
     def show_diff_sync_dialog(self):
         from datetime import datetime
 
@@ -3778,6 +3932,7 @@ class Dialogs:
         bottom_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
         ttk.Button(bottom_frame, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
 
+    # ============ 映射编辑器对话框 ============
     def show_mapping_editor_dialog(self):
         model = self.app.controller.model
         dialog = tk.Toplevel(self.app)
@@ -3966,7 +4121,7 @@ class Dialogs:
         log_text = scrolledtext.ScrolledText(bottom, height=10, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                               insertbackground="white", relief=tk.SOLID, borderwidth=1)
         log_text.pack(fill=tk.BOTH, expand=True)
-        # 先把 3 种颜色 tag 一次性配置好（避免每次 _log 时重复 config）
+
         try:
             log_text.tag_configure("ok", foreground="#4ade80")
             log_text.tag_configure("warn", foreground="#fbbf24")
@@ -3974,41 +4129,19 @@ class Dialogs:
         except Exception:
             pass
 
-        # =====================================================================
-        # L-5 修复：show_advanced_tools_dialog 日志出口统一化
-        #
-        # 原问题：高级工具自己用 `_log(msg)` 直接写 log_text，同时偶尔调用
-        #         `logger.*` 输出到 default_logger；如果 default_logger 已挂
-        #         GuiLogHandler，同一条消息会在「对话框 log_text」+「主窗口
-        #         日志面板」都出现（视觉重复），也排障困难。
-        #
-        # 修复方案：
-        #   1) 为高级工具对话框创建一个独立子 logger（adv_tools.<unique>），
-        #      propagate=False：只被本对话框的 handler 处理，不会冒泡到
-        #      default_logger，因此不会触发主窗口 GuiLogHandler 重复显示。
-        #   2) 给这个子 logger 挂两个 handler：
-        #        - 临时 TkTextHandler：写到对话框自己的 log_text（线程安全）
-        #        - 默认继承 default logger 的 level/format（排障时文件或控制台仍能看到）
-        #   3) 原 `_log(msg, tag)` 不再手动 insert 到 Text，而是直接调用
-        #      logger.log()，真正「统一走 logger」。
-        #   4) 对话框关闭时 detach 临时 handler，避免内存泄漏。
-        # =====================================================================
         import logging as _logging
         import uuid as _uuid
         adv_logger_name = f"adv_tools.{_uuid.uuid4().hex[:8]}"
         adv_logger: _logging.Logger = _logging.getLogger(adv_logger_name)
         adv_logger.setLevel(_logging.DEBUG)
-        adv_logger.propagate = False  # <—— 关键：不冒泡，避免双写主窗口
+        adv_logger.propagate = False
 
-        # 子 logger 复用 default logger 已经挂好的「写文件 / 写 stderr」handler，
-        # 保证排障能看到完整 log；不直接用 default_logger 本体避免 GuiLogHandler
-        # 又给主窗口 log_text 塞一份。
-        for _h in list(default_logger.handlers):
+        from logger import default_logger as _dflt
+        for _h in list(_dflt.handlers):
             try:
                 handler_type_name = type(_h).__name__
             except Exception:
                 handler_type_name = ""
-            # 过滤掉 default_logger 上挂的 GUI handler（只写给主窗口的）
             if handler_type_name == "GuiLogHandler":
                 continue
             try:
@@ -4017,8 +4150,6 @@ class Dialogs:
                 pass
 
         class _TkTextHandler(_logging.Handler):
-            """把 adv_logger 的日志打到当前对话框自己的 log_text（非主窗口）。"""
-
             def __init__(self, app_ref, text_widget):
                 super().__init__(_logging.DEBUG)
                 try:
@@ -4029,7 +4160,6 @@ class Dialogs:
 
             def emit(self, record: _logging.LogRecord):
                 msg: str = self.format(record)
-                # 把 logging 级别翻译成对话框原来的 tag 名字（ok/warn/err/None）
                 lv = record.levelno
                 if lv >= _logging.ERROR:
                     tag = "err"
@@ -4049,7 +4179,6 @@ class Dialogs:
                         try:
                             app_r.after(0, lambda: self._write(msg, tag))
                         except Exception:
-                            # app 已经 destroy / after 不可用：至少别吞掉
                             try:
                                 print(msg)
                             except Exception:
@@ -4058,7 +4187,6 @@ class Dialogs:
                     pass
 
             def _write(self, text: str, tag: str | None) -> None:
-                """只在主线程调用：真正写 Text、tag、滚动。"""
                 try:
                     import datetime as _dt
                     ts = _dt.datetime.now().strftime("%H:%M:%S")
@@ -4094,8 +4222,6 @@ class Dialogs:
 
         _text_handler = _TkTextHandler(app, log_text)
         try:
-            # 保持和 default_logger 相同 formatter（通常带 level/module 但这里简单）
-            from logger import default_logger as _dflt
             if _dflt.handlers:
                 _fmt = getattr(_dflt.handlers[0], "formatter", None)
                 if _fmt:
@@ -4104,7 +4230,6 @@ class Dialogs:
             pass
         adv_logger.addHandler(_text_handler)
 
-        # 关闭时一定卸 handler（子 logger 会 GC，但 handler 引用了 widget weakref 其实也 OK，多一道无坏处）
         def _cleanup_adv_logger_handlers() -> None:
             try:
                 adv_logger.removeHandler(_text_handler)
@@ -4124,8 +4249,8 @@ class Dialogs:
             except Exception:
                 pass
 
-        dialog.destroy = _safe_dialog_destroy  # type: ignore[method-assign]
-        dialog.protocol("WM_DELETE_WINDOW", _safe_dialog_destroy)  # type: ignore[arg-type]
+        dialog.destroy = _safe_dialog_destroy
+        dialog.protocol("WM_DELETE_WINDOW", _safe_dialog_destroy)
 
         def _map_tag_to_level(tag: str | None) -> int:
             t = (tag or "").lower()
@@ -4134,19 +4259,12 @@ class Dialogs:
             if t in {"warn", "warning", "skip"}:
                 return _logging.WARNING
             if t in {"ok", "success", "done"}:
-                # SUCCESS 是我们给 default logger 注册的自定义 level（25）
                 return getattr(_logging, "SUCCESS", 25)
             if t in {"debug", "dbg"}:
                 return _logging.DEBUG
             return _logging.INFO
 
         def _log(msg: str, tag: str | None = None) -> None:
-            """
-            L-5 修复后：任何线程都 OK。不再自己手写 Text 控件，**统一走 logger**。
-            输出路径：adv_logger → _TkTextHandler → 对话框自己的 log_text（只这个框有）
-                    → 同时复用 default_logger 的文件 / stderr handler。
-            不会触发主窗口 GuiLogHandler（因为 propagate=False），避免重复显示。
-            """
             try:
                 level = _map_tag_to_level(tag)
                 adv_logger.log(level, msg)
@@ -4163,17 +4281,11 @@ class Dialogs:
                 pass
 
         def _progress(perc: float, msg: str) -> None:
-            """
-            **线程安全** 的进度条写入。
-              - progress_var.set() 一定 app.after(0) 回主线程。
-              - msg 部分通过已安全的 _log() 写（_log 自己会判断线程）。
-            """
             try:
                 app.after(0, lambda p=float(perc): _do_set_progress_in_main(p))
             except Exception:
                 pass
             if msg:
-                # ⚠️ 用已安全的 _log()，而不是之前的 lambda: _log 再包一层 after（会重复调度，但也是安全）
                 _log(f"⏳ {float(perc):>3.0f}%  {msg}")
 
         def _sel_path() -> str | None:
@@ -4196,7 +4308,7 @@ class Dialogs:
             p = path if os.path.isdir(path) else os.path.dirname(path)
             try:
                 if os.name == "nt":
-                    os.startfile(p)  # type: ignore[attr-defined]
+                    os.startfile(p)
                 elif sys.platform == "darwin":
                     subprocess.Popen(["open", p])
                 else:
@@ -4204,19 +4316,10 @@ class Dialogs:
             except Exception as e:
                 _log(f"打开目录失败：{e}", "warn")
 
-        # ------------- 改用 TaskManager.run_async（共享全局线程池，不再手搓 Thread）-------------
-        # 这个对话框内的所有 _work 函数都必须自己调用 _progress / _log 来写输出
-        # （TaskManager 自带的 _progress_callback / _log 我们不直接对外暴露，
-        #  因为高级工具已经有自己的专属 log_text 和 progress_var）
         from task_manager import TaskManager
         _tm = TaskManager(app, controller=None)
 
         def _submit_work(fn, *, on_done=None) -> None:
-            """
-            把 fn 提交到线程池。fn 本身是「0 参数」callable；如需参数，
-            请在构造时用闭包/partial 绑定（和之前 _in_thread(fn, *args) 不同，这里避免传参歧义）。
-            on_done(result) 会在主线程被调用。
-            """
             def _on_ok(r) -> None:
                 try:
                     if on_done is not None:
@@ -4224,7 +4327,6 @@ class Dialogs:
                 except Exception as _e_done:
                     _log(f"✖ 回调 on_done 异常：{_e_done}", "err")
                 finally:
-                    # 结束时统一把进度条重置到 0（在主线程）
                     try:
                         app.after(0, lambda: _do_set_progress_in_main(0.0))
                     except Exception:
@@ -4245,10 +4347,6 @@ class Dialogs:
             )
 
         def _wrap_throwaway_task(fn):
-            """
-            TaskManager.run_async 要求 func 必须能接收 _progress_callback / _log 两个关键字参数，
-            但高级工具里的 _work 都是纯 0 参。这里包一层，把那两个 kwargs 丢掉，再调原 fn。
-            """
             def _inner(*, _progress_callback=None, _log=None):
                 return fn()
             return _inner
@@ -4274,7 +4372,7 @@ class Dialogs:
             tk.Button(frame, text=btn_text, width=28, bg="#2563eb", fg="white",
                       activebackground="#1d4ed8", command=cmd).pack(anchor=tk.W, pady=(4, 0))
 
-        # A1-1: SMILES → 相似结构搜索（InChIKey 匹配主库）
+        # A1-1: SMILES → 相似结构搜索
         def _smiles_search():
             smi = simpledialog.askstring("SMILES 搜索",
                                          "输入要查找的 SMILES（例如 CC(=O)O）：",
@@ -4289,7 +4387,6 @@ class Dialogs:
                 target_key = res["data"]["inchikey"]
                 target_prefix = target_key.split("-")[0]
                 _log(f"🧬 目标 InChIKey 前缀：{target_prefix}")
-                # 批量算当前库所有 InChIKey
                 files = app.helpers.get_all_files() or []
                 _log(f"📚 计算 {len(files)} 个分子的 InChIKey...")
                 batch = ob_utils.batch_inchikey([f["path"] for f in files])
@@ -4464,7 +4561,7 @@ class Dialogs:
                                         "OB 支持自动格式转换（xyz→sdf 是写入 OB mol block + 标题）。")
                   ).pack(anchor=tk.E)
 
-        # A1-5: InChIKey 批量生成（把 MW/LogP/TPSA 之外再补一个 InChIKey 列）
+        # A1-5: InChIKey 批量生成
         def _gen_inchikeys():
             files = _sel_paths()
             if not files:
@@ -4477,8 +4574,6 @@ class Dialogs:
                 for entry in rr:
                     k = entry.get("inchikey") or ""
                     if k:
-                        p = entry["path"]
-                        # 存进 model.mapping 的英文名做后缀？不需要，写个 CSV 更直观
                         n += 1
                 csv_out = os.path.join(os.path.dirname(files[0]), "InChIKey_batch.csv")
                 try:
@@ -4507,7 +4602,6 @@ class Dialogs:
         tab2 = ttk.Frame(nb)
         nb.add(tab2, text="🧮 波函数 / 构象 / 扫描")
 
-        # 常用 QM 参数小条（所有 QM 功能共用）
         def _qm_controls(parent_for_control):
             frm = tk.LabelFrame(parent_for_control, text="QM 参数（通用）", padx=6, pady=4, fg="#7c2d12")
             frm.pack(fill=tk.X, padx=6, pady=4)
@@ -4602,7 +4696,7 @@ class Dialogs:
              "小提示：如果分子 < 6 个可旋转键 → TopN=5 就够；> 15 个键 → 调大 n_tot 到 200。",
              _conf_search)
 
-        # P4: 二面角 scan（选 4 个原子序号）
+        # P4: 二面角 scan
         def _scan_dihedral():
             import psi4_compute as _p4
             fp = _sel_path()
@@ -4614,7 +4708,6 @@ class Dialogs:
                 n, syms, coords = _p4._parse_xyz(xyz)
             except Exception:
                 _log("✖ XYZ 解析失败", "err"); return
-            # 给用户一个预览表（前 30 个原子），再让输入 4 个 1-based 序号
             preview = "\n".join(f"  {i+1:>3d} {syms[i]:<3s}  "
                                  f"{coords[i][0]: .4f}  {coords[i][1]: .4f}  {coords[i][2]: .4f}"
                                  for i in range(min(n, 40)))
@@ -4651,7 +4744,6 @@ class Dialogs:
                     solvent=_solvent_real(), d3=dv.get(),
                     charge=chv.get(), multiplicity=mulv.get(),
                     memory=memv.get(),
-                    mode="dihedral",
                     _progress_callback=_progress,
                 )
             def _done(r):
@@ -4676,7 +4768,7 @@ class Dialogs:
              "常见应用：联苯邻位阻碍旋转 → 得阻转异构 ΔG‡。",
              _scan_dihedral)
 
-        # 额外工具：一键批量做 "电子性质 CSV"（HOMO/LUMO/Dipole/偶极）
+        # 批量电子性质
         def _batch_properties():
             import psi4_compute as _p4
             files = _sel_paths()
@@ -4733,6 +4825,7 @@ class Dialogs:
         tab3 = ttk.Frame(nb)
         nb.add(tab3, text="⚡ TS / 动力学")
         mv3, bv3, sv3, dv3, chv3, mulv3, memv3 = _qm_controls(tab3)
+
         def _sol3():
             s = sv3.get(); return s if s and s != "（气相）" else None
 
@@ -4784,7 +4877,7 @@ class Dialogs:
              "3. 失败/只有 TS 末端时，可手工用线性扫描做动画作为兜底。",
              _irc_run)
 
-        # X1: R→TS→P 能垒图（ΔG‡f ΔG‡r + Eyring t1/2）
+        # X1: R→TS→P 能垒图
         def _profile_run():
             import psi4_compute as _p4
             files = _sel_paths()
@@ -4839,7 +4932,7 @@ class Dialogs:
              "小贴士：要做图上的 ΔG‡ 单位是 kcal/mol，1 kcal/mol 大约差半衰期 8 倍（室温）。",
              _profile_run)
 
-        # P10: 独立 Eyring 计算器（已有 ΔG‡ 数值直接用）
+        # P10: 独立 Eyring 计算器
         def _eyring_calc():
             import psi4_compute as _p4
             dg = simpledialog.askfloat("Eyring 计算器",
@@ -4878,10 +4971,9 @@ class Dialogs:
         def _sol4():
             s = sv4.get(); return s if s and s != "（气相）" else None
 
-        # X2: pKa SMD 热力学循环（M06-2X/def2-TZVP 推荐默认）
+        # X2: pKa
         def _pka_run():
             import psi4_compute as _p4
-            # 默认给一个高一点的级别，用户可以在 QM 控件里改
             if mv4.get() == "b3lyp":
                 if messagebox.askyesno("pKa 精度建议",
                     "建议 pKa 用 M06-2X/def2-TZVP + SMD water + D3。\n"
@@ -4949,7 +5041,7 @@ class Dialogs:
              "精度：同系物内部相对排序非常稳定。绝对值通常 ±2，需用已知类似物再线性校正。",
              _pka_run)
 
-        # X3: NMR Boltzmann 构象加权 ¹H NMR 谱图
+        # X3: NMR
         def _nmr_run():
             import psi4_compute as _p4
             fp = _sel_path()
@@ -4990,8 +5082,8 @@ class Dialogs:
                     for c in cw:
                         _log(f"   · 构象 {c['rank']:>2}  MMFFΔE = {c['rel_kcal']:+.2f} kcal/mol   "
                              f"Boltzmann 权重 = {c['w']*100:.1f}%")
-                    if r.get("nmr_png"): _log("   · NMR 谱图 PNG：" + os.path.basename(r["nmr_png"]), "ok")
-                    if r.get("nmr_csv"): _log("   · 每个 H 的 δ CSV：" + os.path.basename(r["nmr_csv"]))
+                    if r.get("nmr_png"): _log(f"   · NMR 谱图 PNG：" + os.path.basename(r["nmr_png"]), "ok")
+                    if r.get("nmr_csv"): _log(f"   · 每个 H 的 δ CSV：" + os.path.basename(r["nmr_csv"]))
                     try: _open_dir_try(out_dir)
                     except Exception: pass
                     if not any(s.startswith("CPHF") for s in (log_text.get("1.0", tk.END) or "").split()):

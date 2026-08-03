@@ -204,7 +204,8 @@ def _resolve_obabel_cli() -> str:
         return out
 
     def _safe_real(p: Path, *, user_explicit: bool) -> Path:
-        """解析真实路径 + 安全检查。
+        """
+        解析真实路径 + 安全检查。
         user_explicit=True 时：只做「存在性 + 是文件」检查，不再限制目录（视为用户显式信任）。
         user_explicit=False 时：拒绝 tempdir 和 cwd（家目录放行）。
         """

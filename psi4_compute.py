@@ -304,9 +304,25 @@ def _run_process_with_timeout(
             if not p.is_absolute():
                 return None
             rp = p.resolve(strict=True)
-            if rp.is_symlink():
-                logger.warning("拒绝使用符号链接指向的可执行文件: %s -> %s", path_str, rp)
-                return None
+            # 放宽符号链接限制：只拒绝可写目录下的真实路径，不一律拒绝符号链接
+            # 但保留对路径是否在可写目录的检查
+            import tempfile as _tempfile
+            unsafe_roots: list[Path] = []
+            for _cand in (
+                _tempfile.gettempdir(),
+                os.getcwd(),
+            ):
+                try:
+                    unsafe_roots.append(Path(_cand).resolve(strict=False))
+                except Exception:
+                    continue
+            for root in unsafe_roots:
+                try:
+                    rp.relative_to(root)
+                    logger.warning("拒绝执行在可写目录下的可执行文件: %s (父目录=%s)", rp, root)
+                    return None
+                except ValueError:
+                    pass
             if not rp.is_file():
                 return None
             return str(rp)
@@ -693,6 +709,7 @@ def run_psi4_task(
             except AttributeError as _ma:
                 logger.debug("设置分子多重度 (set_multiplicity) 失败 mult=%d: %s", multiplicity, _ma)
         except Exception as e:
+            logger.warning("准备分子失败: %s", e, exc_info=True)
             return {"success": False, "error": f"准备分子失败: {e}"}
         results: Dict[str, Any] = {
             "success": False,
@@ -1124,6 +1141,7 @@ def run_psi4_task(
         except Exception as e:
             results["error"] = str(e)
             import traceback
+            logger.error("PSI4 任务执行异常: %s", e, exc_info=True)
             traceback.print_exc()
 
         finally:
@@ -1182,6 +1200,7 @@ def parse_psi4_output(log_file: str, task_type: str = 'energy') -> Dict:
                 result["optimized_xyz"] = f"{len(coords)}\nOptimized geometry\n" + "\n".join(coords)
     except Exception as e:
         result["error"] = str(e)
+        logger.debug("解析 PSI4 输出失败: %s", e)
     return result
 
 
@@ -1644,7 +1663,8 @@ def run_irc_task(
         return {"success": False, "error": f"TS 文件不存在: {ts_file}"}
     import tempfile as _tf
     result: dict[str, Any] = {
-        "success": False, "error": None,
+        "success": False,
+        "error": None,
         "forward_xyz_frames": [],
         "backward_xyz_frames": [],
         "combined_trajectory_xyz": None,
@@ -1783,6 +1803,7 @@ def run_irc_task(
         _report(100, "IRC 完成（若 PSI4 编译不含 IRC driver，将只导出 TS ± 单帧 trajectory）")
     except Exception as e:
         result["error"] = f"IRC 失败：{e}"
+        logger.error("IRC 任务异常: %s", e, exc_info=True)
     finally:
         try: shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception: pass
@@ -1982,6 +2003,7 @@ def run_reaction_energy_profile(
         result["kinetics_reverse"] = eyring_kinetics(dGr, T=T_K)
     except Exception as e:
         result["kinetics_error"] = str(e)
+        logger.debug("Eyring 动力学计算失败: %s", e)
 
     # 写 CSV
     csv_path = output_prefix + "_profile.csv"
@@ -2471,6 +2493,7 @@ def run_linear_scan(reactant_files, product_files, steps=20, method='b3lyp', bas
             return result
     except Exception as e:
         result["error"] = f"读取初始结构失败: {e}"
+        logger.debug("线性扫描读取结构失败: %s", e)
         return result
 
     steps = max(2, int(steps))
@@ -2541,6 +2564,7 @@ def run_linear_scan(reactant_files, product_files, steps=20, method='b3lyp', bas
             result["error"] = f"第 {i} 帧 PSI4 执行异常: {e}"
             result["energies"] = energies
             result["trajectory_xyzs"] = traj
+            logger.error("线性扫描帧 %d 异常: %s", i, e, exc_info=True)
             return result
         if not sub.get("success"):
             result["error"] = f"第 {i} 帧能量失败: {sub.get('error') or '未知错误'}"
@@ -2568,6 +2592,7 @@ def run_linear_scan(reactant_files, product_files, steps=20, method='b3lyp', bas
         result["scan_csv"] = str(csv_path)
     except Exception as e:
         result["error"] = f"写出 CSV 失败: {e}"
+        logger.error("线性扫描写 CSV 失败: %s", e, exc_info=True)
 
     result["success"] = result["error"] is None
     result["energies"] = energies
@@ -2599,7 +2624,8 @@ def _set_dihedral_and_write(n: int, atoms: list[str], coords: list[list[float]],
                "--tor", f"{i+1},{j+1},{k+1},{l+1},{angle_deg:.4f}"]
         r = _sp.run(cmd, capture_output=True, text=True, timeout=120, **kw)
         return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    except Exception:
+    except Exception as e:
+        logger.debug("设置二面角失败: %s", e)
         return False
     finally:
         if tmp_in and os.path.exists(tmp_in):
@@ -2639,6 +2665,7 @@ def run_rigid_scan(input_file, scan_atoms, distance_range, method='b3lyp', basis
                 return result
     except Exception as e:
         result["error"] = f"解析输入结构失败: {e}"
+        logger.debug("刚性扫描解析结构失败: %s", e)
         return result
     try:
         exe = ob_utils._resolve_obabel_cli()
@@ -2656,6 +2683,7 @@ def run_rigid_scan(input_file, scan_atoms, distance_range, method='b3lyp', basis
             return result
     except Exception as e:
         result["error"] = f"刚性扫描需要 OpenBabel: {e}"
+        logger.debug("刚性扫描检查 OpenBabel 失败: %s", e)
         return result
 
     start, end, steps = float(distance_range[0]), float(distance_range[1]), max(2, int(distance_range[2]))
@@ -2725,6 +2753,7 @@ def run_rigid_scan(input_file, scan_atoms, distance_range, method='b3lyp', basis
             result["error"] = f"第 {s} 帧 PSI4 异常: {e}"
             result["angles"] = angles
             result["energies"] = energies
+            logger.error("刚性扫描帧 %d 异常: %s", s, e, exc_info=True)
             return result
         if not sub.get("success"):
             result["error"] = f"第 {s} 帧失败: {sub.get('error') or '未知错误'}"
@@ -2750,6 +2779,7 @@ def run_rigid_scan(input_file, scan_atoms, distance_range, method='b3lyp', basis
         result["scan_csv"] = str(csv_path)
     except Exception as e:
         result["error"] = f"写 CSV 失败: {e}"
+        logger.error("刚性扫描写 CSV 失败: %s", e, exc_info=True)
 
     result["success"] = result["error"] is None
     result["angles"] = angles

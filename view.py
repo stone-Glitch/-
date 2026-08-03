@@ -290,6 +290,11 @@ class MainView(tk.Tk):
                 except Exception:
                     pass
 
+            # -------- 全局快捷键绑定（易用性改进）--------
+            self.bind("<Control-g>", lambda e: self._on_ctrl_g())
+            self.bind("<Control-s>", lambda e: self._on_ctrl_s())
+            self.bind("<F1>", lambda e: self._show_help())
+
             self.protocol("WM_DELETE_WINDOW", self.on_close)
         except Exception as e:
             import traceback as _tb
@@ -311,6 +316,55 @@ class MainView(tk.Tk):
                 pass
             # 再原样抛出去，让 main.py 的 load_main 捕获，弹出 showerror 友好提示
             raise
+
+    # ----- 快捷键处理 -----
+    def _on_ctrl_g(self):
+        """Ctrl+G: 打开反应动画对话框"""
+        if hasattr(self.controller, "show_reaction_animation_dialog"):
+            self.controller.show_reaction_animation_dialog()
+        else:
+            self.helpers.on_log("⚠️ 反应动画功能未加载", "warning")
+
+    def _on_ctrl_s(self):
+        """Ctrl+S: 保存当前配置"""
+        try:
+            self._save_config()
+            self.helpers.on_log("✅ 配置已保存", "success")
+        except Exception as e:
+            self.helpers.on_log(f"❌ 保存配置失败: {e}", "error")
+
+    def _show_help(self):
+        """F1: 显示快捷键帮助"""
+        help_text = """⌨️ 快捷键帮助
+
+Ctrl+G  打开反应动画对话框
+Ctrl+S  保存当前配置
+Ctrl+Z  撤销（文件操作）
+Ctrl+Y  重做（文件操作）
+F1      显示此帮助"""
+        try:
+            from tkinter import messagebox
+            messagebox.showinfo("快捷键帮助", help_text)
+        except Exception:
+            pass
+
+    def _save_config(self):
+        """保存当前配置到文件（内部使用）"""
+        config = dict(self.config_data)
+        config.update({
+            "work_dir": self.work_dir_var.get(),
+            "mapping_file": self.mapping_file_var.get(),
+            "ext_filter": self.ext_filter_var.get(),
+            "window_geometry": self.geometry(),
+            "psi4_config": {
+                "last_method": getattr(self, 'psi4_last_method', 'b3lyp'),
+                "last_basis": getattr(self, 'psi4_last_basis', '6-31g*'),
+                "last_task": getattr(self, 'psi4_last_task', 'energy')
+            },
+        })
+        if hasattr(self, "preview_before_operation_var"):
+            config["preview_before_operation"] = bool(self.preview_before_operation_var.get())
+        save_config(config)
 
     # ----- 任务回调（转发给 helpers） -----
     def on_task_done(self, result):

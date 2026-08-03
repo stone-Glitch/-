@@ -12,6 +12,7 @@ Model - 核心业务逻辑
      避免清理/移动操作跟随到外部目录。
   4. export_missing_csv / import_mapping_csv 增加 base_dir 限制，
      rename_by_mapping / organize_by_type / delete_files 增加 symlink / junction 拒绝。
+  5. 【新增】多线程并发保护：mapping、_reverse_mapping、_scan_cache 使用 RLock 保护。
 """
 import os
 import re
@@ -19,6 +20,7 @@ import csv
 import stat
 import shutil
 import hashlib
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -31,9 +33,8 @@ import psi4_compute as psi4_utils
 
 class MolManagerModel:
     def __init__(self, work_dir="output"):
+        self._lock = threading.RLock()
         self.work_dir = Path(work_dir)
-        # 默认工作目录（比如 "output"）不存在就自动创建，避免首次启动时
-        # scan_files 抛 FileNotFoundError 导致空列表/UI 状态不友好
         try:
             if not self.work_dir.exists():
                 self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -49,10 +50,6 @@ class MolManagerModel:
         self.redo_stack: list = []
         self.log_callback = None
         self._suppress_history = False
-        # M-2 修复：扫描缓存失效策略 = 目录 mtime + 显式版本号双通道
-        # 旧设计只靠目录 st_mtime，但 Windows 下重命名单个文件目录 mtime 可能不变，
-        # 导致缓存一直命中过期数据；新增 _scan_cache_revision 在每次 write 操作后 +1，
-        # 配合 scan_cache 键中的 revision 字段确保显式失效的缓存一定不会被命中。
         self._scan_cache: tuple[int, tuple, int, list] | None = None
         self._scan_cache_revision: int = 0
 
@@ -66,10 +63,15 @@ class MolManagerModel:
             getattr(logger, level, logger.info)(msg)
 
     def set_mapping(self, mapping_dict):
-        self.mapping = mapping_dict
-        self._reverse_mapping = {v: k for k, v in mapping_dict.items()}
-        # M-2：mapping 内容改变了会影响 scan 返回的 eng/chn 字段，必须清缓存
-        self.invalidate_scan_cache()
+        with self._lock:
+            self.mapping = mapping_dict
+            self._reverse_mapping = {v: k for k, v in mapping_dict.items()}
+            self.invalidate_scan_cache()
+
+    def invalidate_scan_cache(self):
+        with self._lock:
+            self._scan_cache_revision += 1
+            self._scan_cache = None
 
     # ---------- 映射加载 ----------
     def load_mapping_file(self, path: Path):
@@ -97,11 +99,6 @@ class MolManagerModel:
                 mapping[eng] = chn
         self.set_mapping(mapping)
         return len(mapping), duplicate_count
-
-    def invalidate_scan_cache(self):
-        """调用本方法 = 显式告诉缓存「目录内容或映射已经变了，下次扫描请重新跑」。"""
-        self._scan_cache_revision += 1
-        self._scan_cache = None
 
     def filter_files(self, entries: list[dict], keyword: str="", status: str="全部", ext: str="全部") -> list[dict]:
         result = entries
@@ -136,16 +133,19 @@ class MolManagerModel:
             logger.debug("无法读取工作目录 mtime，跳过缓存: %s", e)
             wd_mtime = 0
 
-        cached = self._scan_cache
-        rev = self._scan_cache_revision
-        # 4 元组：(wd_mtime, ext_filter, cache_revision, result)
-        if cached and len(cached) >= 4 and cached[0] == wd_mtime and cached[1] == ext_filter and cached[2] == rev:
-            return cached[3]
+        with self._lock:
+            cached = self._scan_cache
+            rev = self._scan_cache_revision
+            if cached and len(cached) >= 4 and cached[0] == wd_mtime and cached[1] == ext_filter and cached[2] == rev:
+                return cached[3]
+
+        # 复制映射快照，避免长时间持锁
+        with self._lock:
+            mapping_snapshot = dict(self.mapping)
+            reverse_snapshot = dict(self._reverse_mapping)
 
         result: list[dict] = []
         trash_dir_name = ".trash_backup"
-        mapping = self.mapping
-        reverse_mapping = self._reverse_mapping
         for entry in wd.rglob('*'):
             if not entry.is_file():
                 continue
@@ -168,14 +168,14 @@ class MolManagerModel:
                 eng, chn = base, ''
 
             if ext in ('.mol', '.xyz'):
-                if eng in mapping:
-                    mapped_chn = mapping[eng]
+                if eng in mapping_snapshot:
+                    mapped_chn = mapping_snapshot[eng]
                     status = "✅ 已正确命名" if (has_chinese and chn == mapped_chn) else "⏳ 待重命名"
-                elif base in reverse_mapping:
+                elif base in reverse_snapshot:
                     status = "⏳ 纯中文，待修复"
                 else:
                     status = "❌ 无映射"
-                mapped_chn_out = mapping.get(eng, '')
+                mapped_chn_out = mapping_snapshot.get(eng, '')
             else:
                 status = "📄 计算文件"
                 mapped_chn_out = ''
@@ -193,11 +193,11 @@ class MolManagerModel:
         result.sort(key=lambda x: x['name'])
 
         if wd_mtime:
-            # 存的时候把 revision 号一起存，下次读时 revision 对不上就不命中
-            self._scan_cache = (wd_mtime, ext_filter, rev, result)
+            with self._lock:
+                self._scan_cache = (wd_mtime, ext_filter, rev, result)
         return result
 
-    # ---------- 生成缺失映射列表（修复版） ----------
+    # ---------- 生成缺失映射列表 ----------
     def generate_missing_list(self):
         files = self.scan_files(ext_filter=['.mol', '.xyz'])
         missing = set()
@@ -218,6 +218,8 @@ class MolManagerModel:
         return missing
 
     def export_missing_csv(self, csv_path: str) -> int:
+        # 安全路径校验
+        safe_path = self.resolve_secure_output_path(csv_path, create_parent=True)
         missing_eng = self.generate_missing_list()
         if isinstance(missing_eng, dict):
             missing_list = list(missing_eng.keys())
@@ -225,7 +227,7 @@ class MolManagerModel:
             missing_list = list(missing_eng)
         else:
             missing_list = []
-        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        with open(safe_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.DictWriter(f, fieldnames=['english', 'chinese'])
             writer.writeheader()
             for eng in missing_list:
@@ -233,11 +235,12 @@ class MolManagerModel:
         return len(missing_list)
 
     def import_mapping_csv(self, csv_path: str, overwrite: bool=False) -> dict:
+        safe_path = self.resolve_secure_output_path(csv_path, create_parent=False)
         added = 0
         skipped = 0
         errors = 0
         total_rows = 0
-        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        with open(safe_path, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 total_rows += 1
@@ -249,49 +252,29 @@ class MolManagerModel:
                     if not overwrite and eng in self.mapping:
                         skipped += 1
                     else:
-                        self.mapping[eng] = chn
-                        added += 1
+                        with self._lock:
+                            self.mapping[eng] = chn
+                            added += 1
                 except Exception:
                     errors += 1
-        self._reverse_mapping = {v: k for k, v in self.mapping.items()}
-        self.invalidate_scan_cache()
+        with self._lock:
+            self._reverse_mapping = {v: k for k, v in self.mapping.items()}
+            self.invalidate_scan_cache()
         return {"added": added, "skipped": skipped, "errors": errors, "total_rows": total_rows}
 
     def _strict_basename(self, name: str, allow_subdir: bool = False) -> str:
-        """
-        语义上是「文件名」时做严格校验，防止
-          a. 绝对路径 / 盘符前缀，会让拼接后落到 work_dir 外部；
-          b. .. 段导致向上穿越到 work_dir 父目录；
-          c. 纯 . 或 .. 的文件名；
-          d. allow_subdir=False 时出现子目录段。
-          e. 控制字符（NUL / CR / LF / : / * 等）被传入文件名导致 open 层被「截断」或
-             Windows shell 把 `:` 当成 ADS（alternate data stream）、或把 `..` 当目录穿越。
-
-        allow_subdir=False：**单级文件名不需要 resolve**，
-            否则 Windows 下 OneDrive/非 ASCII 长路径/Junction 会让
-            `(work_dir / pure_filename).resolve()` 得到一个 canonicalized
-            前缀不等于 `self._work_dir_resolved`，造成合法文件被误判。
-        allow_subdir=True：用 **两次** 检查（normpath + resolve），
-            同时规避：
-              - `commonpath` 在含软连接目录时的「真实路径 vs 显示路径」不一致；
-              - 纯 normpath 对「/a/b -> /a/c -> /a/b/../d」这种「先已 resolve 过再穿回父目录」的绕过。
-        """
+        """严格校验文件名，防止路径穿越。"""
         if not isinstance(name, str) or not name:
             raise ValueError("文件名不能为空")
-        # ===== 控制字符 & Windows DOS 设备名检查（CWE-78/14 家族基础防御）=====
-        # 先按原始字符拒绝：NUL 会让 Python open 截断，CR/LF 会让 PS/CMD 命令被截断。
         if any(ch in name for ch in ("\x00", "\r", "\n")):
             raise ValueError(f"文件名包含非法控制字符: {name!r}")
-        # Windows 下常见不允许或不安全的字符（仅严格模式：更安全但可能误伤用户罕见名）。
-        # 我们只拒绝明确危险的 < > : " / \ | ? *（前 3 个在 NTFS ADS / 保留名解析里是高危）
         _DANGEROUS_CHARS: tuple[str, ...] = ("<", ">", ":", '"', "|", "?", "*")
         for ch in _DANGEROUS_CHARS:
             if ch in name:
                 raise ValueError(f"文件名包含非法字符 {ch!r}: {name!r}")
         if Path(name).is_absolute():
             raise ValueError(f"仅接受文件名或相对子目录，禁止绝对路径: {name!r}")
-        # 在规范化 *之前* 先按原始分隔符拆分段，防止 normpath 把 a/../b 压缩成 b 后漏过穿越
-        raw_segs: list[str] = []
+        raw_segs = []
         for ch in ("/", "\\"):
             if ch in name:
                 raw_segs = name.replace("\\", "/").split("/")
@@ -312,9 +295,6 @@ class MolManagerModel:
             raise ValueError(f"文件名段不能为 '.': {name!r}")
         if not allow_subdir and len(parts) != 1:
             raise ValueError(f"仅接受单级文件名，禁止子目录: {name!r}")
-        # Windows DOS 设备名 / 保留名防御（CON / PRN / AUX / NUL / COM1 / LPT1 等）。
-        # CON.txt、CON:stream 这类写法也得拦。如果 allow_subdir=True，对每一段都检查（
-        # 否则可能出现「子目录 CON/...」这种会被 Windows 当设备名打开的路径）。
         _WIN_RESERVED: frozenset[str] = frozenset({
             "CON", "PRN", "AUX", "NUL",
             "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -324,14 +304,11 @@ class MolManagerModel:
             seg_stripped = seg.split(".", 1)[0].strip().rstrip(".").strip()
             if seg_stripped.upper() in _WIN_RESERVED:
                 raise ValueError(f"文件名包含 Windows 保留名，禁止使用: {seg!r}")
-            # Windows 不允许文件名以空格或点结尾（会被静默截断），直接拦掉避免「写 A.txt.
-            # 实际写到 A.txt」这种让上层误以为路径不同的问题。
             if seg.endswith((" ", ".")) and seg not in (".", ".."):
                 raise ValueError(f"文件/目录段禁止以空格或点结尾: {seg!r}")
         if allow_subdir:
             wd_resolved = self._work_dir_resolved
             wd_norm = os.path.normpath(os.fspath(wd_resolved))
-            # --- 检查 1/2：先按 normpath 做路径内越界（不触碰文件系统） ---
             candidate_norm = os.path.normpath(os.fspath(self.work_dir / norm))
             ok_by_norm = False
             try:
@@ -339,27 +316,18 @@ class MolManagerModel:
                 ok_by_norm = os.path.normcase(common) == os.path.normcase(wd_norm)
             except (ValueError, OSError):
                 ok_by_norm = False
-            # --- 检查 2/2：再用 Path.resolve 过一遍真实 FS（软连接展开）---
-            # 只在文件/目录 **已存在** 时才 resolve，避免 Windows 下不存在路径的
-            # resolve() 行为在不同 Python 版本间有差异（旧版本不解析不存在路径）
             try:
                 raw_cand = self.work_dir / norm
                 if raw_cand.exists() or raw_cand.parent.exists():
                     candidate = raw_cand.resolve(strict=False)
                 else:
-                    # 目标不存在 + 父目录也不存在：用严格的 norm/commonpath 兜底即可，
-                    # 因为后续在真正 os.makedirs/open 时还会在 work_dir 前缀下创建，
-                    # 不会穿越（我们前面已 ban 掉绝对路径和 .. 段）。
                     candidate = Path(candidate_norm)
                 candidate.relative_to(wd_resolved)
             except (OSError, ValueError) as exc:
-                # normpath 检查也没过时，就明确抛「超出工作目录范围」；
-                # normpath 过了但 resolve 失败：典型是跨软连接指向外部
                 if not ok_by_norm:
                     raise ValueError(f"解析后位置超出工作目录范围: {name!r}") from exc
                 raise ValueError(f"解析后（含软连接）位置超出工作目录范围: {name!r}") from exc
         return name
-
 
     # ===========================================================
     # 【安全加固 · 审计 1.1 / 2.2 修复】输出路径 / 符号链接 / junction 检查
@@ -374,35 +342,14 @@ class MolManagerModel:
         allow_outside_work_dir: bool = False,
         create_parent: bool = False,
     ) -> Path:
-        """
-        审计 1.1（高）路径遍历修复的统一入口。
-
-        使用场景：
-          * 用户输入的输出目录 / 导出 CSV 路径 / 渲染 PNG 路径 / OB 转换输出路径等
-            → 都先调用本函数拿到真正安全的 Path，再去 open/makedirs/shutil.move。
-
-        行为：
-          1. 把 ``None`` 或空串替换为 ``default_name``（若提供）；
-          2. 若 ``requested_path`` 是绝对路径：
-             - 当 ``allow_outside_work_dir=False`` 时，必须解析后落在 ``base_dir``（默认 work_dir）内；
-             - 当 ``allow_outside_work_dir=True`` 时，允许外部路径（例如用户显式在 filedialog 中选了桌面某处），
-               但仍会拒绝 ``..`` 段并做 symlink/junction 拒绝检查。
-          3. 若为相对路径：按 ``base_dir``（默认 work_dir）拼，用 normpath + resolve 双重检查防穿越。
-          4. 若 ``create_parent=True``，**只会在 base_dir 下创建父目录**；若解析后越界则拒绝创建。
-          5. 返回最终解析后的真实 Path（若文件/目录已存在则返回其 resolve 的 canonical path；否则返回
-             normpath 版本，但 parent 会被 resolve 过，确保不被 symlink 伪目录引导到外部）。
-        """
-        base_dir_resolved: Path
         if base_dir is None:
             base_dir_resolved = self._work_dir_resolved
         else:
             try:
-                base_dir_resolved = Path(base_dir)
-                base_dir_resolved = base_dir_resolved.resolve(strict=True)
+                base_dir_resolved = Path(base_dir).resolve(strict=True)
             except (OSError, ValueError) as _exc:
                 raise ValueError(f"base_dir 无法解析（必须是已存在的目录）: {base_dir!r}") from _exc
 
-        # —— 输入归一化：空 -> default ——
         raw: str
         if requested_path is None:
             raw = ""
@@ -416,19 +363,15 @@ class MolManagerModel:
         if not raw:
             raise ValueError("输出路径为空且未提供 default_name")
 
-        # —— 0. 在任何规范化之前，按原始字符串拒绝 '..' 段（防止 Windows 8.3 短名等绕过）——
         raw_slashed = raw.replace("\\", "/")
         raw_segs = [s for s in raw_slashed.split("/") if s != ""]
         if any(seg == ".." for seg in raw_segs):
             raise ValueError(f"输出路径禁止包含 '..' 段: {raw!r}")
 
         p = Path(raw)
-
-        # —— 1. 相对路径 → 拼到 base_dir_resolved ——
         if not p.is_absolute():
             p = base_dir_resolved / p
 
-        # —— 2. normpath + commonpath（FS 无关）——
         try:
             norm_abs = os.path.normpath(os.fspath(p))
             base_norm = os.path.normpath(os.fspath(base_dir_resolved))
@@ -445,16 +388,11 @@ class MolManagerModel:
 
         candidate_norm = Path(norm_abs)
 
-        # —— 3. symlink / junction 逐级拒绝（从 base 到 candidate）——
-        # 注意：检查 "父目录链" 是否含 symlink / junction；如果 candidate 已存在，也检查其本身
         def _check_chain_up_to(target: Path, base: Path) -> None:
-            """从 base -> target，逐级检查每个已存在的节点非 symlink / junction。"""
-            parts_a = []
             try:
                 rel = target.resolve(strict=False).relative_to(base.resolve(strict=False))
                 parts_a = list(rel.parts)
             except (OSError, ValueError):
-                # target 不在 base 下（理论上前面已 commonpath，但 symlink 可改变真实位置）
                 parts_a = list(target.parts)
             cur = base
             for part in parts_a:
@@ -462,7 +400,6 @@ class MolManagerModel:
                 if not cur.exists():
                     continue
                 enforce_no_symlink_target(cur, allow_nonexistent=True, _level="chain")
-            # 最后检查 target 本身（如果存在）
             if target.exists():
                 enforce_no_symlink_target(target, allow_nonexistent=True, _level="leaf")
 
@@ -471,15 +408,10 @@ class MolManagerModel:
         except ValueError as exc:
             raise ValueError(f"输出路径链中存在符号链接 / Junction，拒绝写入: {raw!r} ({exc})") from exc
 
-        # —— 4. resolve 一次真实路径，用 Path.relative_to 再验证（防 symlink 链绕过 commonpath）——
         try:
-            # 对 "已存在" 的父链尽量用真实 FS resolve；不存在的部分 fallback 到 normpath
-            try:
-                if candidate_norm.exists() or candidate_norm.parent.exists():
-                    resolved = candidate_norm.resolve(strict=False)
-                else:
-                    resolved = candidate_norm
-            except OSError:
+            if candidate_norm.exists() or candidate_norm.parent.exists():
+                resolved = candidate_norm.resolve(strict=False)
+            else:
                 resolved = candidate_norm
             if not allow_outside_work_dir:
                 resolved.relative_to(base_dir_resolved)
@@ -487,12 +419,9 @@ class MolManagerModel:
             raise ValueError(f"解析后真实路径超出允许范围（含 symlink 穿透）: {raw!r}") from exc
 
         final_path = resolved
-
-        # —— 5. 如允许目录 / 或需要创建父目录（只能在 base_dir 内创建）——
         try:
             if create_parent:
                 parent = final_path if is_dir else final_path.parent
-                # 再次确认 parent 不越界
                 if not allow_outside_work_dir:
                     _ = Path(os.path.normpath(os.fspath(parent))).relative_to(
                         Path(os.path.normpath(os.fspath(base_dir_resolved)))
@@ -510,13 +439,6 @@ def enforce_no_symlink_target(
     allow_nonexistent: bool = True,
     _level: str = "leaf",
 ) -> None:
-    """
-    审计 2.2（中）符号链接 / Junction 修复：
-      - ``path`` 若已存在：拒绝 symlink（is_symlink）；Windows 下额外拒绝 junction
-        （通过 lstat 的 FILE_ATTRIBUTE_REPARSE_POINT 判定）。
-      - ``allow_nonexistent``=True 时，path 不存在不报错。
-    使用场景：rename/move/delete/open(W) 前先调用本函数拒绝对 symlink 目标做真实改动。
-    """
     p = Path(path)
     if not p.exists() and allow_nonexistent:
         return
@@ -525,27 +447,18 @@ def enforce_no_symlink_target(
             raise ValueError(f"检测到符号链接（symlink），拒绝操作: {os.fspath(p)!r}")
     except OSError as exc:
         raise ValueError(f"无法判定是否为符号链接: {os.fspath(p)!r} ({exc})") from exc
-    # Windows Junction / 其他 Reparse Point（例如 OneDrive 的离线占位符）
     if os.name == "nt":
         _is_windows_junction(p, _raise=True)
     return
 
 
-# —— 模块级 Windows Junction 检测 ——
 def _is_windows_junction(path: str | os.PathLike, *, _raise: bool = False) -> bool:
-    """
-    Windows NTFS 下判定 path 是否为 Junction / 非 symlink 但带 REPARSE_DATA_BUFFER 的重解析点。
-    - symlink 本身是 reparse point，但在 enforce_no_symlink_target 之前已拒绝；
-      本函数主要覆盖 junction / 挂载点。
-    - 非 Windows 平台始终返回 False。
-    """
     if os.name != "nt":
         return False
     try:
         p = Path(path)
         if not p.exists():
             return False
-        # lstat 不跟随链接；junction 通常是目录，所以不能用 stat
         try:
             st = os.lstat(p)
         except OSError:
@@ -562,8 +475,6 @@ def _is_windows_junction(path: str | os.PathLike, *, _raise: bool = False) -> bo
     return False
 
 
-# 模块级便捷包装：用于 model 外部调用（如 openbabel_utils / psi4_compute / dialogs），
-# 当调用方没有 model 实例，但仍希望按「某个 base_dir」做输出路径安全校验。
 def resolve_secure_output_path_external(
     requested_path,
     *,
@@ -573,11 +484,6 @@ def resolve_secure_output_path_external(
     allow_outside: bool = False,
     create_parent: bool = False,
 ) -> Path:
-    """
-    非 model 场景（例如 openbabel_utils）复用安全输出路径校验的便捷包装。
-    ``base_dir`` 必须是已存在的真实目录；其语义与 model.resolve_secure_output_path 一致。
-    """
-    # 临时构造一个 "无副作用" 的 model 实例太昂贵，这里直接复用其实现的等价骨架：
     if not base_dir:
         raise ValueError("base_dir 不能为空")
     base_p = Path(base_dir)
@@ -621,7 +527,7 @@ def resolve_secure_output_path_external(
                 raise
             raise ValueError(f"输出路径规范化失败: {raw!r}") from exc
     cand = Path(norm_abs)
-    # 链 / 节点 symlink+junction 拒绝
+
     def _walk_chain(target: Path, base: Path) -> None:
         try:
             rel = target.resolve(strict=False).relative_to(base.resolve(strict=False))
@@ -636,6 +542,7 @@ def resolve_secure_output_path_external(
             enforce_no_symlink_target(cur, allow_nonexistent=True, _level="chain")
         if target.exists():
             enforce_no_symlink_target(target, allow_nonexistent=True, _level="leaf")
+
     try:
         _walk_chain(cand, base_real)
     except ValueError as exc:
@@ -661,18 +568,12 @@ def resolve_secure_output_path_external(
     return cand
 
 
-class MolManagerModel_:  # sentinel, never used
-    """占位符（避免意外名称冲突）。"""
-    pass
-
-
 # ---------- 命名修复 ----------
     def _plan_rename(self, file_entry, new_base: str | None, skip_reason: str | None = None):
         if skip_reason is not None:
             return ('skip', skip_reason)
         if new_base is None:
             return ('skip', '未提供新名称')
-        # M-1：new_base 是「不含扩展名的文件名」，必须是单级且不允许绝对路径/..
         try:
             self._strict_basename(f"{new_base}{file_entry.get('ext', '')}")
         except ValueError as exc:
@@ -681,10 +582,8 @@ class MolManagerModel_:  # sentinel, never used
         old_path = self.work_dir / file_entry['name']
         parent = old_path.parent
         new_path = parent / new_name
-        # 【安全加固 2.2】拒绝对 symlink / junction 做重命名（源和目标的父链）
         try:
             enforce_no_symlink_target(old_path, allow_nonexistent=True, _level="src")
-            # 目标本身必然不存在（后面还会判断 exists），这里只检查父目录链
             enforce_no_symlink_target(parent, allow_nonexistent=False, _level="parent")
         except ValueError as exc:
             return ('skip', f"检测到符号链接/Junction: {exc}")
@@ -697,11 +596,6 @@ class MolManagerModel_:  # sentinel, never used
     def _execute_rename_plan(self, plans, action_label: str, history_type: str,
                              history_desc: str, dry_run: bool,
                              _filtered_changes: list[dict] | None = None):
-        """
-        _filtered_changes 来自预览 confirm 对话框：只有用户勾选的 changes 会进来。
-        每条 change 形如 {"from": old_display, "to": new_display, ...}。
-        _filtered_changes=None 表示全部执行；空 list 表示用户全部取消，直接返回 0。
-        """
         if _filtered_changes is not None and len(_filtered_changes) == 0:
             return 0, 0, 0
         _ok_set: set[tuple[str, str]] | None = None
@@ -719,7 +613,6 @@ class MolManagerModel_:  # sentinel, never used
                 skipped += 1
                 continue
             old_display, new_display, old_str, new_str = payload
-            # 如果用户筛选了 changes，用 (from,to) 精确匹配（跳过用户取消的）
             if _ok_set is not None and (str(old_display), str(new_display)) not in _ok_set:
                 skipped += 1
                 continue
@@ -745,7 +638,8 @@ class MolManagerModel_:  # sentinel, never used
             if f['status'] != "⏳ 待重命名":
                 continue
             eng = f['eng']
-            chn = self.mapping.get(eng)
+            with self._lock:
+                chn = self.mapping.get(eng)
             if not chn:
                 plans.append(('skip', f"跳过 {f['name']}: 映射中无此英文名 {eng}"))
                 continue
@@ -754,11 +648,13 @@ class MolManagerModel_:  # sentinel, never used
 
     def fix_chinese_names(self, dry_run=False, *, _filtered_changes: list[dict] | None = None):
         plans = []
+        with self._lock:
+            rev = dict(self._reverse_mapping)
         for f in self.scan_files(ext_filter=['.mol', '.xyz']):
             if f['status'] != "⏳ 纯中文，待修复":
                 continue
             base = f['base']
-            eng = self._reverse_mapping.get(base)
+            eng = rev.get(base)
             if not eng:
                 plans.append(('skip', f"无法找到对应的英文名: {f['name']}"))
                 continue
@@ -767,16 +663,18 @@ class MolManagerModel_:  # sentinel, never used
 
     def fix_all_names(self, dry_run=False, *, _filtered_changes: list[dict] | None = None):
         plans = []
+        with self._lock:
+            mapping_snap = dict(self.mapping)
         for f in self.scan_files(ext_filter=['.mol', '.xyz']):
             correct_name = None
             if f['has_chinese']:
                 eng = f['eng']
-                if eng in self.mapping:
-                    correct_name = f"{eng}（{self.mapping[eng]}）"
+                if eng in mapping_snap:
+                    correct_name = f"{eng}（{mapping_snap[eng]}）"
             elif f['status'] == "⏳ 待重命名":
                 eng = f['eng']
-                if eng in self.mapping:
-                    correct_name = f"{eng}（{self.mapping[eng]}）"
+                if eng in mapping_snap:
+                    correct_name = f"{eng}（{mapping_snap[eng]}）"
             if correct_name is None:
                 plans.append(('skip', None))
                 continue
@@ -785,6 +683,9 @@ class MolManagerModel_:  # sentinel, never used
 
     def fix_incorrect_chinese(self, dry_run=False, *, _filtered_changes: list[dict] | None = None):
         plans = []
+        with self._lock:
+            mapping_snap = dict(self.mapping)
+            rev_snap = dict(self._reverse_mapping)
         for f in self.scan_files(ext_filter=['.mol', '.xyz']):
             if not f['has_chinese']:
                 continue
@@ -792,14 +693,14 @@ class MolManagerModel_:  # sentinel, never used
             chn_in_file = f['chn']
             correct_base = None
             skip_reason = None
-            if eng in self.mapping:
-                correct_chn = self.mapping[eng]
+            if eng in mapping_snap:
+                correct_chn = mapping_snap[eng]
                 if chn_in_file == correct_chn:
                     plans.append(('skip', None))
                     continue
                 correct_base = f"{eng}（{correct_chn}）"
-            elif chn_in_file in self._reverse_mapping:
-                correct_base = f"{self._reverse_mapping[chn_in_file]}（{chn_in_file}）"
+            elif chn_in_file in rev_snap:
+                correct_base = f"{rev_snap[chn_in_file]}（{chn_in_file}）"
             else:
                 skip_reason = (f"无法处理: {f['name']} (英文名 '{eng}' 和中文名 "
                                f"'{chn_in_file}' 均不在映射中)")
@@ -873,11 +774,6 @@ class MolManagerModel_:  # sentinel, never used
                                   history_desc: str, progress_callback=None,
                                   *,
                                   _filtered_changes: list[dict] | None = None):
-        """
-        _filtered_changes 来自预览：[{"from": src_name, "to": dir/, ...}]
-        传空列表表示用户全选取消（直接返回 0）；None 表示全部执行。
-        额外增加：resolve 二次越界校验 + 拒绝把工作目录/.trash_backup 当源或目标。
-        """
         if _filtered_changes is not None and len(_filtered_changes) == 0:
             return 0
         _ok_set: set[tuple[str, str]] | None = None
@@ -896,10 +792,8 @@ class MolManagerModel_:  # sentinel, never used
             processed += 1
             src_name = Path(src).name
             if _ok_set is not None and (str(src_name), str(display_rel)) not in _ok_set:
-                # 用户在预览中取消了这一项
                 continue
             dst_path = Path(dst)
-            # --- 越界二次校验（resolve）：理论上防万一 _strict_basename 漏网 ---
             try:
                 dst_real = dst_path.parent.resolve(strict=False)
                 try:
@@ -909,7 +803,6 @@ class MolManagerModel_:  # sentinel, never used
                     continue
             except OSError:
                 pass
-            # --- 拒绝误操作 .trash_backup 本身 ---
             try:
                 src_real = Path(src).resolve(strict=True)
                 if src_real == trash:
@@ -917,11 +810,8 @@ class MolManagerModel_:  # sentinel, never used
                     continue
             except OSError:
                 pass
-            # =====【审计 2.2 修复：symlink / junction 拒绝】=====
             try:
-                # 源：必须是真实文件（既不允许本身是 symlink，也不允许路径中有任何一段是 symlink）
                 enforce_no_symlink_target(src, allow_nonexistent=False, _level="src")
-                # 目标的父目录：不能是 symlink/junction（避免 shutil.move 穿透到外部目录）
                 dst_parent = Path(dst).parent
                 if dst_parent.exists():
                     enforce_no_symlink_target(dst_parent, allow_nonexistent=False, _level="dst-parent")
@@ -958,7 +848,6 @@ class MolManagerModel_:  # sentinel, never used
             ext = entry.suffix.lower()
             if ext not in ext_map:
                 continue
-            # M-1：ext_map[ext] 语义上是子目录名，严格校验后再拼接
             try:
                 self._strict_basename(ext_map[ext], allow_subdir=False)
             except ValueError as exc:
@@ -984,7 +873,6 @@ class MolManagerModel_:  # sentinel, never used
             groups.setdefault(entry.stem, []).append(entry)
         moves = []
         for base, entries in groups.items():
-            # M-1：stem 作为子目录名，严格校验（stem 可能含非法字符或碰巧是绝对路径/..）
             try:
                 self._strict_basename(base, allow_subdir=False)
             except ValueError as exc:
@@ -1003,7 +891,6 @@ class MolManagerModel_:  # sentinel, never used
         if progress_callback:
             progress_callback(100, "分组完成")
         return moved
-
 
     def prefix_rename(self, prefix, file_list, dry_run=False):
         if not prefix:
@@ -1076,7 +963,6 @@ class MolManagerModel_:  # sentinel, never used
                 rendered += '_'
             base_stem = f"{rendered}{idx:03d}"
             new_name = f"{base_stem}{f['ext']}"
-            # M-1：new_name 必须是严格的文件名（单级 + 无 .. + 解析后在 work_dir 内）
             try:
                 self._strict_basename(new_name)
             except ValueError as exc:
@@ -1122,10 +1008,6 @@ class MolManagerModel_:  # sentinel, never used
         return d
 
     def delete_files(self, filenames: List[str], *, _filtered_names: List[str] | None = None):
-        """
-        删除文件（移动到 .trash_backup）。
-        _filtered_names: 预览确认后用户保留的文件子集（只对这些真删）；None = 全部。
-        """
         if not filenames:
             return 0, []
         filenames = list(filenames)
@@ -1139,7 +1021,6 @@ class MolManagerModel_:  # sentinel, never used
         errors = []
         file_pairs = []
         wd_resolved = self._work_dir_resolved
-        # 保护 .trash_backup 目录本身（路径解析相同就拒绝，避免删 trash 目录下的备份）
         trash_resolved = trash.resolve(strict=False)
         for name in filenames:
             try:
@@ -1157,36 +1038,31 @@ class MolManagerModel_:  # sentinel, never used
             except (OSError, ValueError):
                 errors.append(f"文件解析后不在工作目录中，拒绝删除: {name}")
                 continue
-            # M15：保护 .trash_backup 本身 & 其下所有文件（用户误选备份不允许再删）
             try:
                 if src_real == trash_resolved:
                     errors.append(f"拒绝删除保护目录: {name}")
                     continue
-                trash_resolved.relative_to(src_real)  # 如果 src 是 trash 的父级，会抛
+                trash_resolved.relative_to(src_real)
                 errors.append(f"拒绝删除回收站保护路径: {name}")
                 continue
             except ValueError:
-                # 正常情况：src 既不是 trash 也不是 trash 的父级
                 pass
             try:
-                # 也禁止删除 trash 目录内的现有备份文件（防止"撤销"被破坏）
                 src_rel_tp = src_real.relative_to(trash_resolved)
-                # 能走到这里，说明文件在 trash 里
                 errors.append(f"跳过回收站内部文件: {name}")
                 continue
             except ValueError:
-                # 正常：不在 trash 内，继续
                 pass
             if src.is_symlink() or not src_real.is_file():
                 errors.append(f"仅删除工作目录中的真实文件，跳过: {name}")
                 continue
-            # =====【审计 2.2 修复：在 move-to-trash 之前，拒绝任何 symlink/junction 链 =====
             try:
                 enforce_no_symlink_target(src, allow_nonexistent=False, _level="src")
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                # 回收站目录本身也不能被 symlink 穿透（.trash_backup 路径校验）
-                if dst.parent.exists():
-                    enforce_no_symlink_target(dst.parent, allow_nonexistent=False, _level="trash-parent")
+                dst_parent = trash / Path(name).parent
+                dst = trash / name
+                dst_parent.mkdir(parents=True, exist_ok=True)
+                if dst_parent.exists():
+                    enforce_no_symlink_target(dst_parent, allow_nonexistent=False, _level="trash-parent")
             except ValueError as _se:
                 errors.append(f"检测到符号链接/Junction，拒绝删除: {name} ({_se})")
                 continue
@@ -1194,12 +1070,10 @@ class MolManagerModel_:  # sentinel, never used
             counter = 1
             while dst.exists():
                 stem, ext = src.stem, src.suffix
-                # 如果 name 含子目录（如 sub/a.xyz），冲突时把计数器写到文件名上，但保留原目录结构
                 name_as_path = Path(name)
                 new_name = name_as_path.parent / f"{stem}_{counter}{ext}"
                 dst = trash / new_name
                 counter += 1
-            # 如果 name 含子目录段，先在 trash 里建好对应的父目录（保证 shutil.move 有地方落）
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
             except OSError as _e_mk:
@@ -1253,7 +1127,6 @@ class MolManagerModel_:  # sentinel, never used
         if progress_callback:
             progress_callback(100, "清理完成")
         self._log(f"✅ 重复文件清理完成：发现 {duplicates_found} 个重复副本，已删除 {deleted} 个", 'success')
-        # M-2：删文件后显式清缓存，避免 mtime 没刷新时 UI 继续显示已删条目
         self.invalidate_scan_cache()
         return deleted, errors
 
@@ -1502,22 +1375,6 @@ class MolManagerModel_:  # sentinel, never used
     def run_rigid_scan(self, input_file, scan_atoms, distance_range, method='b3lyp', basis='6-31g*',
                        output_dir=None, preset_name=None, solvent=None, d3=False,
                        charge=0, multiplicity=1, progress_callback=None):
-        """
-        刚性扫描（固定原子对距离）
-        :param input_file: 输入文件路径
-        :param scan_atoms: 元组 (atom1_index, atom2_index) 0-based
-        :param distance_range: 元组 (start, end, steps)
-        :param method: 计算方法
-        :param basis: 基组
-        :param output_dir: 输出目录
-        :param preset_name: 预设名称
-        :param solvent: 溶剂
-        :param d3: DFT-D3
-        :param charge: 电荷
-        :param multiplicity: 多重度
-        :param progress_callback: 进度回调
-        :return: 结果字典
-        """
         return psi4_utils.run_rigid_scan(
             input_file, scan_atoms, distance_range, method, basis, output_dir,
             preset_name, solvent, d3, charge, multiplicity,
