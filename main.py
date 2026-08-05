@@ -10,13 +10,15 @@
 import os
 import sys
 import time
+import math
+import random
 import shutil
 import tempfile
 import tkinter as tk
 from pathlib import Path
 
-from logger import default_logger as logger
-from path_utils import is_windows_junction
+from utils.logger import default_logger as logger
+from utils.path_utils import is_windows_junction
 
 
 def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
@@ -104,125 +106,267 @@ def _cleanup_stale_tempdirs(max_age_seconds: int = 3 * 24 * 3600) -> int:
 
 class SplashScreen:
     """
-    🫧 Aurora Frost Splash：
-      • 深夜蓝渐变底（Canvas 手绘）
-      • 中间一个发光分子轨道图（Canvas 画 3 条同心椭圆 + 旋转粒子）
-      • 标题 Microsoft YaHei UI 加粗白字 + 副字紫蓝渐变
-      • 底部进度 + 动态加载点
+    🫧 Aurora Frost Splash（v2 动效增强版）：
+      • 深夜蓝渐变底 + 流动的极光波带
+      • 左侧发光分子轨道：原子核脉冲 + 3 个电子沿椭圆轨道真实公转
+      • 标题带柔光描边 + 副标题渐变胶囊
+      • 底部进度条带流光高光 + 动态加载点 + 轮换状态提示
+    对外接口保持与旧版一致：self.root / self.close()。
     """
+
+    # —— 配色（与 App 主题 Aurora Frost 一致）——
+    BG_C1 = (15, 23, 51)      # #0F1733
+    BG_C2 = (27, 31, 75)      # #1B1F4B
+    ACCENT = "#0EA288"        # teal
+    BLUE = "#3B6EFF"
+    PURPLE = "#8B5CF6"
+    INK = "#FFFFFF"
+    SUB = "#B7CCFF"
+    MUTE = "#8B9DCF"
+
+    W, H = 540, 300
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
-        W, H = 480, 260
+        W, H = self.W, self.H
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        x = (sw - W) // 2
-        y = (sh - H) // 2
-        self.root.geometry(f"{W}x{H}+{x}+{y}")
+        self.root.geometry(f"{W}x{H}+{(sw - W)//2}+{(sh - H)//2}")
         self.canvas = tk.Canvas(self.root, width=W, height=H, bg="#0F1733",
                                 highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        # —— 背景渐变：深夜 #0F1733 → 分子紫 #1B1F4B ——
-        self._bg_c1 = (15, 23, 51)
-        self._bg_c2 = (27, 31, 75)
-        self._draw_bg()
-        # —— 极光粒子光斑 ——
-        import random
+
         self._rng = random.Random(42)
-        for _ in range(6):
-            cx = int(self._rng.uniform(0, W))
-            cy = int(self._rng.uniform(0, H))
-            r = int(self._rng.uniform(50, 140))
-            col = self._rng.choice(["#3B6EFF", "#0EA288", "#8B5CF6"])
-            for k in range(5, 0, -1):
-                alpha = 0.05 * k
-                self.canvas.create_oval(cx - r * k / 5, cy - r * k / 5,
-                                        cx + r * k / 5, cy + r * k / 5,
-                                        outline=col, width=0,
-                                        fill=self._mix_with_bg(col, alpha)))
-        # —— 左侧分子轨道图（发光原子核 + 3 条椭圆轨道 + 3 个电子）——
-        mx, my = 90, 130
-        # 核（渐变圆：多层）
-        for k in range(8, 0, -1):
-            rad = 3 + k * 2
-            alpha = 0.12 * k
-            self.canvas.create_oval(mx - rad, my - rad, mx + rad, my + rad,
-                                    outline="", fill=self._mix_with_bg("#0EA288", alpha))
-        self.canvas.create_oval(mx - 5, my - 5, mx + 5, my + 5,
-                                outline="#FFFFFF", fill="#0EA288", width=1)
-        # 3 条轨道（装饰性椭圆线框，用 create_oval 兼容性最好；
-        # 注意 create_oval 不支持 style/start/extent，所以直接画整椭圆）
-        self._orbit_items = []
-        for idx, (ry, rx, rot) in enumerate([(36, 62, 0), (48, 52, 25), (44, 64, -25)]):
-            col = ["#3B6EFF", "#8B5CF6", "#0EA288"][idx]
-            item = self.canvas.create_oval(mx - rx, my - ry, mx + rx, my + ry,
-                                           outline=col, width=2)
-            # 简单近似：不真的旋转椭圆，用 canvas 画点模拟电子沿轨道
-            self._orbit_items.append((mx, my, rx, ry, rot, col, idx))
-        # —— 标题 ——
-        self.canvas.create_text(210, 95, anchor="w",
-                                text="分子与计算文件管理器",
-                                fill="#FFFFFF",
-                                font=("Microsoft YaHei UI", 20, "bold"))
-        # 副标题（彩色胶囊）
-        sub = self.canvas.create_rectangle(210, 122, 456, 148,
-                                           outline="#3B6EFF", fill="#1A224F", width=1)
-        self.canvas.create_text(222, 135, anchor="w",
-                                text="  🫧  Aurora Frost   ·   分子文件 · QM · 动画 · 工具箱",
-                                fill="#B7CCFF",
-                                font=("Microsoft YaHei UI", 10))
-        # —— 底部状态文字 / 进度点 ——
-        self.status_lbl = self.canvas.create_text(210, 195, anchor="w",
-                                                   text="正在初始化…",
-                                                   fill="#8B9DCF",
-                                                   font=("Microsoft YaHei UI", 10))
-        self.dots_lbl = self.canvas.create_text(210, 222, anchor="w",
-                                                text="",
-                                                fill="#3B6EFF",
-                                                font=("Consolas", 14, "bold"))
-        self.progress_bar_bg = self.canvas.create_rectangle(210, 232, 440, 240,
-                                                            outline="#2A3067", fill="#1A224F")
-        self.progress_bar = self.canvas.create_rectangle(210, 232, 210, 240,
-                                                         outline="", fill="#0EA288")
+        self._draw_bg()
+        self._init_aurora()
+        self._init_particles()
+        self._init_orbit()
+        self._init_ui()
+
         self.anim_running = True
-        self._after_ids: list[str] = []
+        self._after_ids = []
+        self._frame = 0
         self._t0 = 0
         self._animate()
         self.root.update()
 
-    # ——— 工具：颜色混合（带 alpha 叠到背景色）———
-    def _mix_with_bg(self, hex_col: str, alpha: float) -> str:
-        h = hex_col.lstrip("#")
-        r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
-        br, bg_, bb = self._bg_c1
-        rr = int(br + (r - br) * alpha)
-        gg = int(bg_ + (g - bg_) * alpha)
-        bb = int(bb + (b - bb) * alpha)
-        return f"#{rr:02x}{gg:02x}{bb:02x}"
+    # ——— 颜色工具 ———
+    @staticmethod
+    def _hex_to_rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    def _mix_with_bg(self, hex_col, alpha):
+        r, g, b = self._hex_to_rgb(hex_col)
+        br, bg_, bb = self.BG_C1
+        return f"#{int(br+(r-br)*alpha):02x}{int(bg_+(g-bg_)*alpha):02x}{int(bb+(b-bb)*alpha):02x}"
 
     def _draw_bg(self):
-        W = self.canvas.winfo_reqwidth()
-        H = self.canvas.winfo_reqheight()
+        W, H = self.W, self.H
         for y in range(0, H, 2):
             t = y / max(1, H - 1)
             t_e = t * t * (3 - 2 * t)
-            r = int(self._bg_c1[0] + (self._bg_c2[0] - self._bg_c1[0]) * t_e)
-            g = int(self._bg_c1[1] + (self._bg_c2[1] - self._bg_c1[1]) * t_e)
-            b = int(self._bg_c1[2] + (self._bg_c2[2] - self._bg_c1[2]) * t_e)
+            r = int(self.BG_C1[0] + (self.BG_C2[0] - self.BG_C1[0]) * t_e)
+            g = int(self.BG_C1[1] + (self.BG_C2[1] - self.BG_C1[1]) * t_e)
+            b = int(self.BG_C1[2] + (self.BG_C2[2] - self.BG_C1[2]) * t_e)
             col = f"#{r:02x}{g:02x}{b:02x}"
             self.canvas.create_rectangle(0, y, W, y + 2, fill=col, outline=col)
+        # 顶部一抹冷光晕，增强“极光”氛围
+        for k in range(6, 0, -1):
+            self.canvas.create_rectangle(0, 0, W, k * 14,
+                                         fill=self._mix_with_bg(self.BLUE, 0.04 * k), outline="")
+
+    def _init_aurora(self):
+        W, H = self.W, self.H
+        self._aurora = []
+        # (base_y, amp, wave_len, speed, thickness, color)
+        specs = [
+            (H * 0.30, 16, 380, 0.020, 24, self.BLUE),
+            (H * 0.58, 22, 300, -0.015, 30, self.PURPLE),
+            (H * 0.82, 14, 440, 0.012, 20, self.ACCENT),
+        ]
+        dx = 18
+        xs = list(range(0, W + dx, dx))
+        for base_y, amp, wl, speed, th, color in specs:
+            # 占位多边形，_step_aurora 每帧刷新真实波形
+            item = self.canvas.create_polygon([0, 0, W, 0],
+                                              outline="",
+                                              fill=self._mix_with_bg(color, 0.16),
+                                              smooth=True)
+            self._aurora.append((item, xs, base_y, amp, wl, speed, th, color))
+
+    def _init_orbit(self):
+        W, H = self.W, self.H
+        mx, my = int(W * 0.18), int(H * 0.5)
+        self._omx, self._omy = mx, my
+        # 核外大 halo（呼吸式辉光，置于最底层）
+        self._nucleus_glow = self.canvas.create_oval(mx - 20, my - 20, mx + 20, my + 20,
+                                                     outline="", fill=self._mix_with_bg(self.ACCENT, 0.10))
+        # 核脉冲光晕（多层，随帧缩放）
+        self._nucleus = []
+        for k in range(6, 0, -1):
+            rad = 4 + k * 2
+            item = self.canvas.create_oval(mx - rad, my - rad, mx + rad, my + rad,
+                                           outline="", fill=self._mix_with_bg(self.ACCENT, 0.10 * k))
+            self._nucleus.append(item)
+        self._nucleus_core = self.canvas.create_oval(mx - 5, my - 5, mx + 5, my + 5,
+                                                     outline="#FFFFFF", fill=self.ACCENT, width=1)
+        # 三条轨道（装饰椭圆）+ 3 个真实公转的电子（glow + core）
+        self._electrons = []
+        orbit_specs = [
+            (38, 70, 0, self.BLUE, 0.16),
+            (52, 60, 28, self.PURPLE, -0.12),
+            (44, 75, -28, self.ACCENT, 0.20),
+        ]
+        rot = math.pi / 180
+        for ry, rx, rotd, color, spd in orbit_specs:
+            self.canvas.create_oval(mx - rx, my - ry, mx + rx, my + ry,
+                                    outline=self._mix_with_bg(color, 0.55), width=1.5)
+            glow = self.canvas.create_oval(mx - rx - 9, my - 9, mx - rx + 9, my + 9,
+                                           outline="", fill=self._mix_with_bg(color, 0.35))
+            core = self.canvas.create_oval(mx - rx - 4, my - 4, mx - rx + 4, my + 4,
+                                           outline="#FFFFFF", fill=color, width=1)
+            # 末尾 0.0 为电子相位（公转角度），每帧累加
+            self._electrons.append([glow, core, rx, ry, rotd * rot, color, spd, 0.0])
+
+    def _init_ui(self):
+        W = self.W
+        x0 = int(W * 0.37)
+        # 标题：多方向淡蓝柔光描边 + 实心白字
+        gy = 92
+        for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+            self.canvas.create_text(x0 + dx, gy + dy, anchor="w",
+                                    text="分子与计算文件管理器",
+                                    fill=self._mix_with_bg(self.BLUE, 0.5),
+                                    font=("Microsoft YaHei UI", 20, "bold"))
+        self.canvas.create_text(x0, gy, anchor="w",
+                                text="分子与计算文件管理器",
+                                fill=self.INK, font=("Microsoft YaHei UI", 20, "bold"))
+        # 副标题胶囊
+        self.canvas.create_rectangle(x0, 120, W - 20, 148,
+                                     outline=self._mix_with_bg(self.BLUE, 0.6),
+                                     fill="#1A224F", width=1)
+        self.canvas.create_text(x0 + 12, 134, anchor="w",
+                                text="  🫧  Aurora Frost   ·   分子文件 · QM · 动画 · 工具箱",
+                                fill=self.SUB, font=("Microsoft YaHei UI", 10))
+        # 状态 / 加载点 / 进度条
+        self.status_lbl = self.canvas.create_text(x0, 198, anchor="w",
+                                                  text="正在初始化…", fill=self.MUTE,
+                                                  font=("Microsoft YaHei UI", 10))
+        self.dots_lbl = self.canvas.create_text(x0, 228, anchor="w", text="",
+                                                fill=self.BLUE, font=("Consolas", 14, "bold"))
+        self._pbar_x0, self._pbar_x1 = x0, W - 40
+        self._pbar_y0, self._pbar_y1 = 260, 272
+        self.canvas.create_rectangle(self._pbar_x0, self._pbar_y0,
+                                     self._pbar_x1, self._pbar_y1,
+                                     outline=self._mix_with_bg(self.BLUE, 0.4), fill="#1A224F")
+        self.progress_bar = self.canvas.create_rectangle(
+            self._pbar_x0, self._pbar_y0, self._pbar_x0, self._pbar_y1,
+            outline="", fill=self._mix_with_bg(self.ACCENT, 0.95))
+        # 进度条流光高光（在已填充区间内循环移动）
+        self._shimmer = self.canvas.create_rectangle(
+            self._pbar_x0, self._pbar_y0, self._pbar_x0 + 24, self._pbar_y1,
+            outline="", fill="#BFF7EC")
+        self.canvas.itemconfigure(self._shimmer, state="hidden")
+        # 进度百分比数字
+        self.pct_lbl = self.canvas.create_text(self._pbar_x1 + 10, (self._pbar_y0 + self._pbar_y1) // 2,
+                                              anchor="w", text="0%", fill=self.ACCENT,
+                                              font=("Microsoft YaHei UI", 10, "bold"))
+
+    def _init_particles(self):
+        W, H = self.W, self.H
+        self._particles = []
+        rng = random.Random(7)
+        for _ in range(14):
+            r = rng.uniform(1.0, 2.6)
+            x = rng.uniform(0, W)
+            y = rng.uniform(0, H)
+            vx = rng.uniform(-0.25, 0.25)
+            vy = rng.uniform(-0.18, 0.18)
+            col = rng.choice([self.BLUE, self.PURPLE, self.ACCENT])
+            item = self.canvas.create_oval(x - r, y - r, x + r, y + r, outline="",
+                                          fill=self._mix_with_bg(col, 0.5))
+            self._particles.append([item, x, y, vx, vy, r, col])
+
+    def _step_particles(self):
+        W, H = self.W, self.H
+        for p in self._particles:
+            item, x, y, vx, vy, r, col = p
+            x += vx
+            y += vy
+            if x < -4:
+                x = W + 4
+            elif x > W + 4:
+                x = -4
+            if y < -4:
+                y = H + 4
+            elif y > H + 4:
+                y = -4
+            p[1], p[2] = x, y
+            a = 0.35 + 0.30 * (0.5 + 0.5 * math.sin(self._frame * 0.08 + x))
+            self.canvas.coords(item, x - r, y - r, x + r, y + r)
+            self.canvas.itemconfigure(item, fill=self._mix_with_bg(col, a))
+
+    def _step_aurora(self):
+        for item, xs, base_y, amp, wl, speed, th, color in self._aurora:
+            ph = self._frame * speed
+            pts = []
+            for x in xs:
+                y = base_y + amp * math.sin(2 * math.pi * x / wl + ph)
+                pts.append((x, y))
+            for x in reversed(xs):
+                y = base_y + amp * math.sin(2 * math.pi * x / wl + ph) + th
+                pts.append((x, y))
+            self.canvas.coords(item, *[c for p in pts for c in p])
+
+    def _step_orbit(self):
+        mx, my = self._omx, self._omy
+        # 核脉冲
+        pulse = 1.0 + 0.18 * math.sin(self._frame * 0.12)
+        # 核外大 halo 呼吸
+        gp = 0.5 + 0.5 * math.sin(self._frame * 0.12)
+        gr = 16 + 8 * gp
+        self.canvas.coords(self._nucleus_glow, mx - gr, my - gr, mx + gr, my + gr)
+        self.canvas.itemconfigure(self._nucleus_glow, fill=self._mix_with_bg(self.ACCENT, 0.06 + 0.05 * gp))
+        for k, item in enumerate(self._nucleus):
+            rad = (4 + (6 - k) * 2) * pulse
+            self.canvas.coords(item, mx - rad, my - rad, mx + rad, my + rad)
+        # 电子沿椭圆真实公转（含轨道倾角旋转）
+        for e in self._electrons:
+            glow, core, rx, ry, rot, color, spd, phase = e
+            phase = phase + spd
+            e[7] = phase
+            xe = rx * math.cos(phase)
+            ye = ry * math.sin(phase)
+            x = mx + xe * math.cos(rot) - ye * math.sin(rot)
+            y = my + xe * math.sin(rot) + ye * math.cos(rot)
+            self.canvas.coords(glow, x - 9, y - 9, x + 9, y + 9)
+            self.canvas.coords(core, x - 4, y - 4, x + 4, y + 4)
 
     def _animate(self):
-        if not self.anim_running:
+        if not self.anim_running or not self.root.winfo_exists():
             return
+        self._frame += 1
         self._t0 += 1
-        # 进度点
-        dots = "●" * ((self._t0 % 7)) + "○" * max(0, 6 - (self._t0 % 7))
+        self._step_aurora()
+        self._step_orbit()
+        # 加载点
+        n = self._t0 % 7
+        dots = "●" * n + "○" * (6 - n)
         self.canvas.itemconfigure(self.dots_lbl, text=dots[:6])
         # 进度条：缓慢推进（最多到 ~90% 等待主窗口就绪）
         t = min(0.9, self._t0 / 80)
-        self.canvas.coords(self.progress_bar, 210, 232, 210 + (440 - 210) * t, 240)
+        x1 = self._pbar_x0 + (self._pbar_x1 - self._pbar_x0) * t
+        self.canvas.coords(self.progress_bar, self._pbar_x0, self._pbar_y0, x1, self._pbar_y1)
+        self.canvas.itemconfigure(self.pct_lbl, text=f"{int(t * 100)}%")
+        self._step_particles()
+        # 流光高光在已填充区间内循环移动
+        if x1 - self._pbar_x0 > 28:
+            self.canvas.itemconfigure(self._shimmer, state="normal")
+            span = int(x1 - self._pbar_x0 - 28)
+            sx = self._pbar_x0 + ((self._frame * 6) % max(1, span))
+            self.canvas.coords(self._shimmer, sx, self._pbar_y0, sx + 24, self._pbar_y1)
         # 状态轮换
         tips = ["正在初始化…", "加载 OpenBabel…", "准备 PSI4 接口…", "构建 UI…"]
         self.canvas.itemconfigure(self.status_lbl, text=tips[min(len(tips) - 1, self._t0 // 20)])
@@ -370,7 +514,7 @@ def main():
         captured_tb: str = ""
         app = None
         try:
-            from view import MainView
+            from core.view import MainView
             # 关 splash 再实例化主窗口（主窗口实例化失败时下面的 except 会再次安全关一次）
             _close_splash_safely()
             try:
